@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <climits>
 #include <memory>
+#include <exception>
 
 #include "llama.h"
 
@@ -19,36 +20,155 @@ llama_context* context = nullptr;
 
 bool backendInitialized = false;
 
-void releaseModelLocked() {
+// Convert UTF-8 into UTF-16 for Android JNI.
+std::u16string utf8ToUtf16(const std::string& input) {
 
-    if (context != nullptr) {
-        llama_free(context);
-        context = nullptr;
+    std::u16string output;
+
+    size_t i = 0;
+
+    while (i < input.size()) {
+
+        uint32_t codePoint = 0;
+        unsigned char c =
+            static_cast<unsigned char>(input[i]);
+
+        size_t extra = 0;
+
+        if (c <= 0x7F) {
+            codePoint = c;
+        } else if (c >= 0xC2 && c <= 0xDF) {
+            codePoint = c & 0x1F;
+            extra = 1;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            codePoint = c & 0x0F;
+            extra = 2;
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            codePoint = c & 0x07;
+            extra = 3;
+        } else {
+            output.push_back(u'\uFFFD');
+            ++i;
+            continue;
+        }
+
+        if (i + extra >= input.size()) {
+            output.push_back(u'\uFFFD');
+            break;
+        }
+
+        bool valid = true;
+
+        for (size_t j = 1; j <= extra; ++j) {
+
+            unsigned char next =
+                static_cast<unsigned char>(input[i + j]);
+
+            if ((next & 0xC0) != 0x80) {
+                valid = false;
+                break;
+            }
+
+            codePoint =
+                (codePoint << 6) | (next & 0x3F);
+        }
+
+        if (!valid) {
+            output.push_back(u'\uFFFD');
+            ++i;
+            continue;
+        }
+
+        if (
+            (extra == 1 && codePoint < 0x80) ||
+            (extra == 2 && codePoint < 0x800) ||
+            (extra == 3 && codePoint < 0x10000) ||
+            codePoint > 0x10FFFF ||
+            (codePoint >= 0xD800 && codePoint <= 0xDFFF)
+        ) {
+            output.push_back(u'\uFFFD');
+            i += extra + 1;
+            continue;
+        }
+
+        if (codePoint <= 0xFFFF) {
+
+            output.push_back(
+                static_cast<char16_t>(codePoint)
+            );
+
+        } else {
+
+            codePoint -= 0x10000;
+
+            output.push_back(
+                static_cast<char16_t>(
+                    0xD800 + (codePoint >> 10)
+                )
+            );
+
+            output.push_back(
+                static_cast<char16_t>(
+                    0xDC00 + (codePoint & 0x3FF)
+                )
+            );
+        }
+
+        i += extra + 1;
     }
 
-    if (model != nullptr) {
-        llama_model_free(model);
-        model = nullptr;
-    }
+    return output;
 }
 
 jstring makeResult(
     JNIEnv* env,
     const std::string& value
 ) {
-    return env->NewStringUTF(value.c_str());
+
+    std::u16string converted =
+        utf8ToUtf16(value);
+
+    return env->NewString(
+        reinterpret_cast<const jchar*>(
+            converted.data()
+        ),
+        static_cast<jsize>(converted.size())
+    );
+}
+
+jstring makeError(
+    JNIEnv* env,
+    const std::string& message
+) {
+
+    return makeResult(
+        env,
+        "خطا: " + message
+    );
+}
+
+void releaseModelLocked() {
+
+    if (context != nullptr) {
+
+        llama_free(context);
+        context = nullptr;
+    }
+
+    if (model != nullptr) {
+
+        llama_model_free(model);
+        model = nullptr;
+    }
 }
 
 bool decodeBatch(
     llama_context* ctx,
     llama_batch batch
 ) {
-    const int32_t result = llama_decode(ctx, batch);
 
-    // Only zero means successful processing.
-    // 1: no KV slot available.
-    // 2: processing aborted.
-    // Negative values: invalid input or fatal error.
+    const int32_t result =
+        llama_decode(ctx, batch);
 
     return result == 0;
 }
@@ -60,7 +180,7 @@ extern "C"
 JNIEXPORT jstring JNICALL
 Java_com_faridtech_ai_NativeLlama_nativeBridgeCheck(
     JNIEnv* env,
-    jobject /* this */
+    jobject
 ) {
 
     return makeResult(
@@ -74,22 +194,27 @@ extern "C"
 JNIEXPORT jstring JNICALL
 Java_com_faridtech_ai_NativeLlama_nativeLoadModel(
     JNIEnv* env,
-    jobject /* this */,
+    jobject,
     jstring modelPath
 ) {
 
     if (modelPath == nullptr) {
-        return makeResult(
+
+        return makeError(
             env,
             "مسیر مدل مشخص نشده است."
         );
     }
 
     const char* pathChars =
-        env->GetStringUTFChars(modelPath, nullptr);
+        env->GetStringUTFChars(
+            modelPath,
+            nullptr
+        );
 
     if (pathChars == nullptr) {
-        return makeResult(
+
+        return makeError(
             env,
             "خواندن مسیر مدل ناموفق بود."
         );
@@ -107,6 +232,7 @@ Java_com_faridtech_ai_NativeLlama_nativeLoadModel(
     try {
 
         if (!backendInitialized) {
+
             llama_backend_init();
             backendInitialized = true;
         }
@@ -124,7 +250,8 @@ Java_com_faridtech_ai_NativeLlama_nativeLoadModel(
             );
 
         if (newModel == nullptr) {
-            return makeResult(
+
+            return makeError(
                 env,
                 "بارگذاری مدل ناموفق بود. فایل GGUF را بررسی کن."
             );
@@ -149,15 +276,13 @@ Java_com_faridtech_ai_NativeLlama_nativeLoadModel(
 
             llama_model_free(newModel);
 
-            return makeResult(
+            return makeError(
                 env,
                 "ساخت محیط اجرای مدل ناموفق بود."
             );
         }
 
-        // Replace the previous model only after
-        // the new model and context are ready.
-
+        // Keep the old model until the new one is ready.
         releaseModelLocked();
 
         model = newModel;
@@ -168,11 +293,18 @@ Java_com_faridtech_ai_NativeLlama_nativeLoadModel(
             "مدل با موفقیت بارگذاری شد."
         );
 
-    } catch (...) {
+    } catch (const std::exception&) {
 
-        return makeResult(
+        return makeError(
             env,
             "خطای غیرمنتظره هنگام بارگذاری مدل."
+        );
+
+    } catch (...) {
+
+        return makeError(
+            env,
+            "خطای ناشناخته هنگام بارگذاری مدل."
         );
     }
 }
@@ -182,23 +314,28 @@ extern "C"
 JNIEXPORT jstring JNICALL
 Java_com_faridtech_ai_NativeLlama_nativeGenerate(
     JNIEnv* env,
-    jobject /* this */,
+    jobject,
     jstring promptText,
     jint maxTokens
 ) {
 
     if (promptText == nullptr) {
-        return makeResult(
+
+        return makeError(
             env,
             "پیام خالی است."
         );
     }
 
     const char* promptChars =
-        env->GetStringUTFChars(promptText, nullptr);
+        env->GetStringUTFChars(
+            promptText,
+            nullptr
+        );
 
     if (promptChars == nullptr) {
-        return makeResult(
+
+        return makeError(
             env,
             "خواندن پیام ناموفق بود."
         );
@@ -212,14 +349,16 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
     );
 
     if (prompt.empty()) {
-        return makeResult(
+
+        return makeError(
             env,
             "لطفاً پیام خود را وارد کن."
         );
     }
 
     if (prompt.size() > 64000) {
-        return makeResult(
+
+        return makeError(
             env,
             "پیام بیش از حد طولانی است."
         );
@@ -228,7 +367,8 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
     std::lock_guard<std::mutex> lock(engineMutex);
 
     if (model == nullptr || context == nullptr) {
-        return makeResult(
+
+        return makeError(
             env,
             "ابتدا باید مدل را بارگذاری کنی."
         );
@@ -246,14 +386,19 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
             llama_model_get_vocab(model);
 
         if (vocab == nullptr) {
-            return makeResult(
+
+            return makeError(
                 env,
                 "واژگان مدل در دسترس نیست."
             );
         }
 
-        if (prompt.size() > static_cast<size_t>(INT32_MAX - 16)) {
-            return makeResult(
+        if (
+            prompt.size() >
+            static_cast<size_t>(INT32_MAX - 16)
+        ) {
+
+            return makeError(
                 env,
                 "طول پیام بیش از حد مجاز است."
             );
@@ -263,18 +408,20 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
             prompt.size() + 16
         );
 
-        int32_t tokenCount = llama_tokenize(
-            vocab,
-            prompt.c_str(),
-            static_cast<int32_t>(prompt.size()),
-            tokens.data(),
-            static_cast<int32_t>(tokens.size()),
-            true,
-            true
-        );
+        int32_t tokenCount =
+            llama_tokenize(
+                vocab,
+                prompt.c_str(),
+                static_cast<int32_t>(prompt.size()),
+                tokens.data(),
+                static_cast<int32_t>(tokens.size()),
+                true,
+                true
+            );
 
         if (tokenCount == INT32_MIN) {
-            return makeResult(
+
+            return makeError(
                 env,
                 "طول پیام برای تبدیل به توکن بیش از حد مجاز است."
             );
@@ -282,7 +429,8 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
 
         if (tokenCount < 0) {
 
-            const int32_t required = -tokenCount;
+            const int32_t required =
+                -tokenCount;
 
             tokens.resize(
                 static_cast<size_t>(required)
@@ -300,7 +448,8 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
         }
 
         if (tokenCount <= 0) {
-            return makeResult(
+
+            return makeError(
                 env,
                 "تبدیل پیام به توکن ناموفق بود."
             );
@@ -314,25 +463,27 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
             llama_n_ctx(context);
 
         if (tokens.size() >= contextSize) {
-            return makeResult(
+
+            return makeError(
                 env,
                 "پیام برای ظرفیت فعلی مدل بیش از حد طولانی است."
             );
         }
 
-        // Process the prompt in batches.
         const int32_t batchLimit =
             static_cast<int32_t>(
                 llama_n_batch(context)
             );
 
         if (batchLimit <= 0) {
-            return makeResult(
+
+            return makeError(
                 env,
                 "ظرفیت پردازش دسته‌ای مدل معتبر نیست."
             );
         }
 
+        // Process the prompt in batches.
         for (
             size_t offset = 0;
             offset < tokens.size();
@@ -347,20 +498,22 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
                     )
                 );
 
-            llama_batch batch = llama_batch_get_one(
-                tokens.data() + offset,
-                count
-            );
+            llama_batch batch =
+                llama_batch_get_one(
+                    tokens.data() + offset,
+                    count
+                );
 
             if (!decodeBatch(context, batch)) {
-                return makeResult(
+
+                return makeError(
                     env,
                     "پردازش پیام توسط موتور هوش مصنوعی ناموفق بود."
                 );
             }
         }
 
-        // Initialize the sampling chain.
+        // Create sampling chain.
         llama_sampler_chain_params samplerParams =
             llama_sampler_chain_default_params();
 
@@ -373,30 +526,33 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
         );
 
         if (!sampler) {
-            return makeResult(
+
+            return makeError(
                 env,
                 "ساخت نمونه‌گیر ناموفق بود."
             );
         }
 
-        auto addSampler = [&](llama_sampler* item) -> bool {
+        auto addSampler =
+            [&](llama_sampler* item) -> bool {
 
-            if (item == nullptr) {
-                return false;
-            }
+                if (item == nullptr) {
+                    return false;
+                }
 
-            llama_sampler_chain_add(
-                sampler.get(),
-                item
-            );
+                llama_sampler_chain_add(
+                    sampler.get(),
+                    item
+                );
 
-            return true;
-        };
+                return true;
+            };
 
         if (!addSampler(
             llama_sampler_init_top_k(40)
         )) {
-            return makeResult(
+
+            return makeError(
                 env,
                 "ساخت فیلتر Top-K ناموفق بود."
             );
@@ -405,7 +561,8 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
         if (!addSampler(
             llama_sampler_init_top_p(0.90f, 1)
         )) {
-            return makeResult(
+
+            return makeError(
                 env,
                 "ساخت فیلتر Top-P ناموفق بود."
             );
@@ -414,7 +571,8 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
         if (!addSampler(
             llama_sampler_init_temp(0.70f)
         )) {
-            return makeResult(
+
+            return makeError(
                 env,
                 "تنظیم دمای تولید ناموفق بود."
             );
@@ -423,7 +581,8 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
         if (!addSampler(
             llama_sampler_init_dist(LLAMA_DEFAULT_SEED)
         )) {
-            return makeResult(
+
+            return makeError(
                 env,
                 "ساخت نمونه‌گیر تصادفی ناموفق بود."
             );
@@ -441,8 +600,8 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
 
         for (int i = 0; i < limit; ++i) {
 
-            // Sample from the last available logits.
-            llama_token newToken =
+            // Sample from the last token logits.
+            const llama_token newToken =
                 llama_sampler_sample(
                     sampler.get(),
                     context,
@@ -465,23 +624,51 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
                     false
                 );
 
+            if (pieceLength == INT32_MIN) {
+
+                return makeError(
+                    env,
+                    "اندازه متن خروجی معتبر نیست."
+                );
+            }
+
             if (pieceLength < 0) {
 
+                const size_t required =
+                    static_cast<size_t>(
+                        -static_cast<int64_t>(pieceLength)
+                    );
+
+                if (
+                    required >=
+                    static_cast<size_t>(INT32_MAX)
+                ) {
+
+                    return makeError(
+                        env,
+                        "اندازه توکن خروجی بیش از حد مجاز است."
+                    );
+                }
+
                 std::vector<char> largeBuffer(
-                    static_cast<size_t>(-pieceLength) + 1
+                    required + 1
                 );
 
-                pieceLength = llama_token_to_piece(
-                    vocab,
-                    newToken,
-                    largeBuffer.data(),
-                    static_cast<int32_t>(largeBuffer.size()),
-                    0,
-                    false
-                );
+                pieceLength =
+                    llama_token_to_piece(
+                        vocab,
+                        newToken,
+                        largeBuffer.data(),
+                        static_cast<int32_t>(
+                            largeBuffer.size()
+                        ),
+                        0,
+                        false
+                    );
 
                 if (pieceLength <= 0) {
-                    return makeResult(
+
+                    return makeError(
                         env,
                         "تبدیل توکن خروجی به متن ناموفق بود."
                     );
@@ -500,7 +687,7 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
                 );
             }
 
-            // Do not exceed the context capacity.
+            // Keep generated tokens within context capacity.
             if (
                 tokens.size() +
                 static_cast<size_t>(i) + 1 >= contextSize
@@ -508,24 +695,25 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
                 break;
             }
 
-            // Evaluate the sampled token to obtain
-            // logits for the next generation step.
+            // Evaluate sampled token for next generation.
             llama_batch nextBatch =
                 llama_batch_get_one(
-                    &newToken,
+                    const_cast<llama_token*>(&newToken),
                     1
                 );
 
             if (!decodeBatch(context, nextBatch)) {
-                return makeResult(
+
+                return makeError(
                     env,
-                    "پردازش توکن خروجی ناموفق بود؛ پاسخ کامل تولید نشد."
+                    "پردازش توکن خروجی ناموفق بود."
                 );
             }
         }
 
         if (output.empty()) {
-            return makeResult(
+
+            return makeError(
                 env,
                 "مدل پاسخی تولید نکرد."
             );
@@ -536,11 +724,18 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
             output
         );
 
-    } catch (...) {
+    } catch (const std::exception&) {
 
-        return makeResult(
+        return makeError(
             env,
             "خطای غیرمنتظره هنگام تولید پاسخ."
+        );
+
+    } catch (...) {
+
+        return makeError(
+            env,
+            "خطای ناشناخته هنگام تولید پاسخ."
         );
     }
 }
@@ -549,8 +744,8 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
 extern "C"
 JNIEXPORT void JNICALL
 Java_com_faridtech_ai_NativeLlama_nativeRelease(
-    JNIEnv* /* env */,
-    jobject /* this */
+    JNIEnv*,
+    jobject
 ) {
 
     std::lock_guard<std::mutex> lock(engineMutex);
