@@ -70,8 +70,13 @@ fun ChatScreen(
     var downloading by remember { mutableStateOf(false) }
     var modelReady by remember { mutableStateOf(false) }
     var downloadProgress by remember { mutableStateOf(0) }
+
     var downloadStatus by remember {
         mutableStateOf("در حال بررسی مدل...")
+    }
+
+    var nativeStatus by remember {
+        mutableStateOf("در حال آزمایش ارتباط با موتور بومی...")
     }
 
     val listState = rememberLazyListState()
@@ -91,10 +96,23 @@ fun ChatScreen(
 
     LaunchedEffect(Unit) {
         modelReady = engine.checkModel()
+
         downloadStatus = if (modelReady) {
             "مدل روی گوشی نصب است."
         } else {
             "برای استفاده آفلاین، ابتدا مدل را دانلود کنید."
+        }
+
+        nativeStatus = try {
+            val result = NativeLlama().nativeBridgeCheck()
+
+            if (result == "FARID TECH AI Native Bridge is ready") {
+                "اتصال Kotlin و C++ با موفقیت برقرار شد."
+            } else {
+                "پاسخ غیرمنتظره از موتور بومی: $result"
+            }
+        } catch (e: Throwable) {
+            "خطا در اتصال موتور بومی: ${e.message ?: e.javaClass.simpleName}"
         }
     }
 
@@ -107,7 +125,7 @@ fun ChatScreen(
             downloadProgress = 0
 
             try {
-                val file = downloader.download { downloaded, total ->
+                downloader.download { downloaded, total ->
                     if (total > 0) {
                         downloadProgress =
                             ((downloaded * 100) / total)
@@ -118,6 +136,7 @@ fun ChatScreen(
 
                 modelReady = engine.checkModel()
                 downloadProgress = 100
+
                 downloadStatus = if (modelReady) {
                     "مدل با موفقیت دانلود شد."
                 } else {
@@ -189,6 +208,25 @@ fun ChatScreen(
                 "دستیار هوشمند شخصی",
                 style = MaterialTheme.typography.titleLarge
             )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Card(
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+
+                    Text(
+                        "وضعیت اتصال موتور بومی",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+
+                    Text(nativeStatus)
+                }
+            }
 
             Spacer(modifier = Modifier.height(8.dp))
 
