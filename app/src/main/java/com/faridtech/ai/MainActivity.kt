@@ -22,6 +22,9 @@ class MainActivity : ComponentActivity() {
 
     private var ownerUnlocked by mutableStateOf(false)
 
+    // Prevent accidental locking while the system file picker is open.
+    internal var externalPickerOpen = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -51,7 +54,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
-        ownerUnlocked = false
+
+        if (!externalPickerOpen) {
+            ownerUnlocked = false
+        }
     }
 }
 
@@ -66,9 +72,11 @@ fun OwnerAccessScreen(
     var password by remember { mutableStateOf("") }
     var confirmPassword by remember { mutableStateOf("") }
     var error by remember { mutableStateOf("") }
+
     var configured by remember {
         mutableStateOf(security.isConfigured())
     }
+
     var selectedSection by remember {
         mutableStateOf<String?>(null)
     }
@@ -76,6 +84,8 @@ fun OwnerAccessScreen(
     LaunchedEffect(unlocked) {
         if (!unlocked) {
             selectedSection = null
+            password = ""
+            confirmPassword = ""
         }
     }
 
@@ -89,6 +99,11 @@ fun OwnerAccessScreen(
                     context = context,
                     onBack = {
                         selectedSection = null
+                    },
+                    onExternalPickerStateChanged = { isOpen ->
+                        (context as? MainActivity)?.let {
+                            it.externalPickerOpen = isOpen
+                        }
                     }
                 )
             }
