@@ -11,6 +11,8 @@ class LocalAIEngine(private val context: Context) {
     companion object {
         private const val MODEL_NAME =
             "Qwen2.5-Coder-1.5B-Q4_K_M.gguf"
+
+        private const val MIN_MODEL_SIZE = 500_000_000L
     }
 
     private val modelFile: File
@@ -22,13 +24,14 @@ class LocalAIEngine(private val context: Context) {
     fun isModelAvailable(): Boolean {
         return modelFile.exists() &&
             modelFile.isFile &&
-            modelFile.length() > 500_000_000L
+            modelFile.length() >= MIN_MODEL_SIZE
     }
 
-    suspend fun checkModel(): Boolean =
-        withContext(Dispatchers.IO) {
+    suspend fun checkModel(): Boolean {
+        return withContext(Dispatchers.IO) {
             isModelAvailable()
         }
+    }
 
     fun getModelPath(): String? {
         return if (isModelAvailable()) {
@@ -38,17 +41,16 @@ class LocalAIEngine(private val context: Context) {
         }
     }
 
-    suspend fun generate(prompt: String): String =
-        withContext(Dispatchers.IO) {
+    suspend fun generate(prompt: String): String {
+        return withContext(Dispatchers.IO) {
+
             if (prompt.isBlank()) {
-                return@withContext "لطفاً پیام خود را وارد کنید."
+                "لطفاً پیام خود را وارد کنید."
+            } else if (!isModelAvailable()) {
+                "مدل هوش مصنوعی هنوز نصب نشده است."
+            } else {
+                "فایل مدل شناسایی شد؛ موتور اجرای هوش مصنوعی هنوز متصل نشده است."
             }
-
-            if (!isModelAvailable()) {
-                return@withContext
-                    "مدل هوش مصنوعی هنوز نصب نشده است."
-            }
-
-            "فایل مدل شناسایی شد؛ موتور اجرای هوش مصنوعی هنوز متصل نشده است."
         }
+    }
 }
