@@ -1,3 +1,4 @@
+
 package com.faridtech.ai
 
 import android.content.Context
@@ -20,8 +21,8 @@ class ModelDownloader(context: Context) {
         private const val MIN_MODEL_SIZE = 500_000_000L
     }
 
-    private val modelDirectory = File(
-        context.getExternalFilesDir(null),
+    private val modelDirectory: File = File(
+        context.getExternalFilesDir(null) ?: context.filesDir,
         "models"
     )
 
@@ -39,8 +40,6 @@ class ModelDownloader(context: Context) {
         if (finalFile.exists() && finalFile.length() >= MIN_MODEL_SIZE) {
             return@withContext finalFile
         }
-
-        if (finalFile.exists()) finalFile.delete()
 
         val existingSize = if (partialFile.exists()) {
             partialFile.length()
@@ -73,13 +72,15 @@ class ModelDownloader(context: Context) {
             }
 
             val append = response == HttpURLConnection.HTTP_PARTIAL
+
             val startSize = if (append) existingSize else 0L
 
             val contentRange = connection.getHeaderField("Content-Range")
 
-            if (append && (contentRange == null ||
-                    !contentRange.startsWith("bytes $existingSize-"))
-            ) {
+            if (append && (
+                contentRange == null ||
+                !contentRange.startsWith("bytes $existingSize-")
+            )) {
                 throw IllegalStateException("پاسخ ادامه دانلود معتبر نیست.")
             }
 
@@ -87,14 +88,15 @@ class ModelDownloader(context: Context) {
                 contentRange.substringAfterLast("/")
                     .toLongOrNull() ?: -1L
             } else {
-                connection.contentLengthLong.let {
-                    if (it > 0) it + startSize else -1L
-                }
+                connection.contentLengthLong
             }
 
             connection.inputStream.use { input ->
                 RandomAccessFile(partialFile, "rw").use { output ->
-                    if (!append) output.setLength(0)
+
+                    if (!append) {
+                        output.setLength(0)
+                    }
 
                     output.seek(startSize)
 
@@ -103,28 +105,43 @@ class ModelDownloader(context: Context) {
 
                     while (true) {
                         val count = input.read(buffer)
+
                         if (count == -1) break
 
                         output.write(buffer, 0, count)
                         downloaded += count
+
                         onProgress(downloaded, totalSize)
                     }
                 }
             }
 
             if (totalSize > 0 && partialFile.length() != totalSize) {
-                throw IllegalStateException("دانلود ناقص است؛ فایل موقت حفظ شد.")
+                throw IllegalStateException(
+                    "دانلود ناقص است؛ فایل موقت حفظ شد."
+                )
             }
 
             if (partialFile.length() < MIN_MODEL_SIZE) {
-                throw IllegalStateException("حجم فایل مدل معتبر نیست.")
+                throw IllegalStateException(
+                    "حجم فایل مدل معتبر نیست."
+                )
+            }
+
+            if (finalFile.exists() && !finalFile.delete()) {
+                throw IllegalStateException(
+                    "حذف فایل مدل قبلی ناموفق بود."
+                )
             }
 
             if (!partialFile.renameTo(finalFile)) {
-                throw IllegalStateException("انتقال فایل مدل ناموفق بود.")
+                throw IllegalStateException(
+                    "انتقال فایل مدل ناموفق بود."
+                )
             }
 
             finalFile
+
         } finally {
             connection?.disconnect()
         }
