@@ -25,12 +25,13 @@ class LocalAIEngine(private val context: Context) {
 
         private const val GGUF_VERSION_MIN = 2
         private const val GGUF_VERSION_MAX = 3
+
+        private const val MAX_GENERATION_TOKENS = 256
     }
 
     private val native = NativeLlama()
 
-    // Prevent simultaneous model loading,
-    // generation, import and release operations.
+    // Protect model loading, generation, import and release.
     private val engineMutex = Mutex()
 
     @Volatile
@@ -49,6 +50,23 @@ class LocalAIEngine(private val context: Context) {
             )
         }
 
+    private val temporaryFile: File
+        get() {
+            return File(
+                modelFile.parentFile,
+                "$MODEL_NAME.importing"
+            )
+        }
+
+    private val backupFile: File
+        get() {
+            return File(
+                modelFile.parentFile,
+                "$MODEL_NAME.previous"
+            )
+        }
+
+    // Validate GGUF magic, version and minimum file size.
     private fun hasValidGgufHeader(file: File): Boolean {
 
         if (
@@ -210,7 +228,6 @@ class LocalAIEngine(private val context: Context) {
                         loadModelLocked()
 
                     if (loadResult != LOAD_SUCCESS) {
-
                         return@withLock loadResult
                     }
                 }
@@ -219,7 +236,7 @@ class LocalAIEngine(private val context: Context) {
 
                     native.nativeGenerate(
                         prompt,
-                        256
+                        MAX_GENERATION_TOKENS
                     )
 
                 } catch (e: Exception) {
@@ -262,13 +279,13 @@ class LocalAIEngine(private val context: Context) {
 
                 try {
 
+                    val originalLength =
+                        modelFile.length()
+
                     val output =
                         context.contentResolver
                             .openOutputStream(uri, "w")
                             ?: return@withLock false
-
-                    val originalLength =
-                        modelFile.length()
 
                     val copiedBytes = output.use { destination ->
 
@@ -278,7 +295,8 @@ class LocalAIEngine(private val context: Context) {
                         }
                     }
 
-                    copiedBytes == originalLength
+                    copiedBytes == originalLength &&
+                        hasValidGgufHeader(modelFile)
 
                 } catch (_: Exception) {
 
@@ -304,21 +322,21 @@ class LocalAIEngine(private val context: Context) {
                     return@withLock false
                 }
 
-                val temporaryFile = File(
-                    parent,
-                    "$MODEL_NAME.importing"
-                )
-
-                val backupFile = File(
-                    parent,
-                    "$MODEL_NAME.previous"
-                )
-
                 var oldModelMoved = false
 
                 try {
 
-                    // Copy the selected file to a temporary location.
+                    // Do not overwrite an existing recovery backup.
+                    if (backupFile.exists()) {
+                        return@withLock false
+                    }
+
+                    // Remove an incomplete temporary import.
+                    if (temporaryFile.exists()) {
+                        temporaryFile.delete()
+                    }
+
+                    // Copy the selected model into a temporary file.
                     val input =
                         context.contentResolver
                             .openInputStream(uri)
@@ -329,10 +347,11 @@ class LocalAIEngine(private val context: Context) {
                         temporaryFile.outputStream().use { destination ->
 
                             source.copyTo(destination)
+                            destination.fd.sync()
                         }
                     }
 
-                    // Validate before replacing the current model.
+                    // Validate before replacing the installed model.
                     if (!hasValidGgufHeader(temporaryFile)) {
 
                         temporaryFile.delete()
@@ -340,23 +359,9 @@ class LocalAIEngine(private val context: Context) {
                         return@withLock false
                     }
 
-                    // Never overwrite an existing recovery backup.
-                    if (backupFile.exists()) {
-
-                        temporaryFile.delete()
-
-                        return@withLock false
-                    }
-
-                    // Release the in-memory model before replacing its file.
-                    try {
-
-                        native.nativeRelease()
-
-                    } finally {
-
-                        loadedModelPath = null
-                    }
+                    // Release native memory before replacing model file.
+                    native.nativeRelease()
+                    loadedModelPath = null
 
                     val hadOldModel = modelFile.exists()
 
@@ -372,12 +377,14 @@ class LocalAIEngine(private val context: Context) {
                         oldModelMoved = true
                     }
 
-                    // Install the validated temporary file.
+                    // Move the validated file into its final location.
                     if (!temporaryFile.renameTo(modelFile)) {
 
                         if (oldModelMoved) {
-                            backupFile.renameTo(modelFile)
-                            oldModelMoved = false
+
+                            if (backupFile.renameTo(modelFile)) {
+                                oldModelMoved = false
+                            }
                         }
 
                         temporaryFile.delete()
@@ -385,23 +392,27 @@ class LocalAIEngine(private val context: Context) {
                         return@withLock false
                     }
 
-                    // Validate the installed file again.
+                    // Validate the installed model again.
                     if (!hasValidGgufHeader(modelFile)) {
 
                         modelFile.delete()
 
                         if (oldModelMoved) {
-                            backupFile.renameTo(modelFile)
-                            oldModelMoved = false
+
+                            if (backupFile.renameTo(modelFile)) {
+                                oldModelMoved = false
+                            }
                         }
 
                         return@withLock false
                     }
 
-                    // New model is installed successfully.
-                    if (backupFile.exists()) {
+                    // Installation succeeded.
+                    if (oldModelMoved && backupFile.exists()) {
                         backupFile.delete()
                     }
+
+                    loadedModelPath = null
 
                     true
 
@@ -409,7 +420,7 @@ class LocalAIEngine(private val context: Context) {
 
                     temporaryFile.delete()
 
-                    // Restore the old model if installation failed.
+                    // Attempt to restore the previous model.
                     if (
                         oldModelMoved &&
                         backupFile.exists() &&
