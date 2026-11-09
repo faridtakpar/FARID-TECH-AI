@@ -12,16 +12,25 @@ import java.net.URL
 class ModelDownloader(context: Context) {
 
     companion object {
+
         private const val MODEL_NAME =
             "Qwen2.5-Coder-1.5B-Q4_K_M.gguf"
 
         private const val MODEL_URL =
             "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
 
-        private const val MIN_MODEL_SIZE = 500_000_000L
+        // Exact size of the selected Q4_K_M model.
+        private const val EXPECTED_MODEL_SIZE =
+            1_117_320_768L
+
+        private const val MIN_MODEL_SIZE =
+            500_000_000L
 
         private const val GGUF_VERSION_MIN = 2
         private const val GGUF_VERSION_MAX = 3
+
+        private const val CONNECT_TIMEOUT = 30000
+        private const val READ_TIMEOUT = 60000
     }
 
     private val modelDirectory: File = File(
@@ -39,14 +48,21 @@ class ModelDownloader(context: Context) {
         File(modelDirectory, "$MODEL_NAME.previous")
 
     private fun hasValidGgufHeader(file: File): Boolean {
-        if (!file.exists() || !file.isFile || file.length() < 8L) {
+
+        if (
+            !file.exists() ||
+            !file.isFile ||
+            file.length() < 8L
+        ) {
             return false
         }
 
         return try {
+
             RandomAccessFile(file, "r").use { input ->
 
                 val magic = ByteArray(4)
+
                 input.readFully(magic)
 
                 if (
@@ -62,41 +78,56 @@ class ModelDownloader(context: Context) {
                     input.readInt()
                 )
 
-                version in GGUF_VERSION_MIN..GGUF_VERSION_MAX
+                version in
+                    GGUF_VERSION_MIN..GGUF_VERSION_MAX
             }
+
         } catch (_: Exception) {
+
             false
         }
+    }
+
+    private fun isCompleteModel(file: File): Boolean {
+
+        return file.exists() &&
+            file.isFile &&
+            file.length() == EXPECTED_MODEL_SIZE &&
+            file.length() >= MIN_MODEL_SIZE &&
+            hasValidGgufHeader(file)
     }
 
     suspend fun download(
         onProgress: (Long, Long) -> Unit = { _, _ -> }
     ): File = withContext(Dispatchers.IO) {
 
-        if (!modelDirectory.exists() && !modelDirectory.mkdirs()) {
+        if (
+            !modelDirectory.exists() &&
+            !modelDirectory.mkdirs()
+        ) {
             throw IllegalStateException(
                 "ساخت پوشه مدل ناموفق بود."
             )
         }
 
-        // Do not replace an existing valid model.
-        if (hasValidGgufHeader(finalFile) &&
-            finalFile.length() >= MIN_MODEL_SIZE
-        ) {
+        // Keep an already complete model.
+        if (isCompleteModel(finalFile)) {
             return@withContext finalFile
         }
 
+        // Never overwrite an existing recovery backup.
         if (backupFile.exists()) {
             throw IllegalStateException(
                 "نسخه پشتیبان قبلی وجود دارد؛ ابتدا وضعیت آن را بررسی کن."
             )
         }
 
-        // Validate an existing partial file before resuming.
+        // Remove invalid or oversized partial downloads.
         if (partialFile.exists()) {
+
             if (
-                partialFile.length() < 8L ||
-                !hasValidGgufHeader(partialFile)
+                !hasValidGgufHeader(partialFile) ||
+                partialFile.length() >= EXPECTED_MODEL_SIZE
             ) {
                 partialFile.delete()
             }
@@ -115,8 +146,8 @@ class ModelDownloader(context: Context) {
             connection = (URL(MODEL_URL).openConnection()
                 as HttpURLConnection).apply {
 
-                connectTimeout = 30000
-                readTimeout = 60000
+                connectTimeout = CONNECT_TIMEOUT
+                readTimeout = READ_TIMEOUT
                 instanceFollowRedirects = true
                 requestMethod = "GET"
 
@@ -131,6 +162,7 @@ class ModelDownloader(context: Context) {
                 )
 
                 if (existingSize > 0L) {
+
                     setRequestProperty(
                         "Range",
                         "bytes=$existingSize-"
@@ -158,8 +190,6 @@ class ModelDownloader(context: Context) {
                 0L
             }
 
-            var totalSize = -1L
-
             if (append) {
 
                 val contentRange =
@@ -181,25 +211,50 @@ class ModelDownloader(context: Context) {
                 val rangeEnd =
                     match.groupValues[2].toLong()
 
-                totalSize =
+                val totalSize =
                     match.groupValues[3].toLong()
+
+                val receivedRangeSize =
+                    rangeEnd - rangeStart + 1L
+
+                val responseBodySize =
+                    connection.contentLengthLong
 
                 if (
                     rangeStart != existingSize ||
                     rangeEnd < rangeStart ||
-                    totalSize <= rangeEnd
+                    totalSize != EXPECTED_MODEL_SIZE ||
+                    rangeEnd != totalSize - 1L ||
+                    receivedRangeSize <= 0L ||
+                    (
+                        responseBodySize >= 0L &&
+                        responseBodySize != receivedRangeSize
+                    )
                 ) {
                     throw IllegalStateException(
-                        "محدوده دریافتی سرور با فایل قبلی سازگار نیست."
+                        "محدوده دریافتی سرور با فایل مدل سازگار نیست."
                     )
                 }
 
             } else {
 
-                totalSize = connection.contentLengthLong
+                val responseSize =
+                    connection.contentLengthLong
+
+                if (
+                    responseSize >= 0L &&
+                    responseSize != EXPECTED_MODEL_SIZE
+                ) {
+                    throw IllegalStateException(
+                        "اندازه اعلام‌شده فایل با نسخه اصلی مدل مطابقت ندارد."
+                    )
+                }
             }
 
-            val expectedFinalSize = totalSize
+            onProgress(
+                startSize,
+                EXPECTED_MODEL_SIZE
+            )
 
             connection.inputStream.use { input ->
 
@@ -226,13 +281,28 @@ class ModelDownloader(context: Context) {
                             break
                         }
 
-                        output.write(buffer, 0, count)
+                        if (
+                            downloaded + count >
+                            EXPECTED_MODEL_SIZE
+                        ) {
+                            partialFile.delete()
+
+                            throw IllegalStateException(
+                                "حجم دریافتی بیشتر از اندازه فایل اصلی است."
+                            )
+                        }
+
+                        output.write(
+                            buffer,
+                            0,
+                            count
+                        )
 
                         downloaded += count
 
                         onProgress(
                             downloaded,
-                            expectedFinalSize
+                            EXPECTED_MODEL_SIZE
                         )
                     }
 
@@ -240,10 +310,9 @@ class ModelDownloader(context: Context) {
                 }
             }
 
-            // Verify final size when the server provides it.
+            // Verify exact file size.
             if (
-                expectedFinalSize > 0L &&
-                partialFile.length() != expectedFinalSize
+                partialFile.length() != EXPECTED_MODEL_SIZE
             ) {
                 throw IllegalStateException(
                     "دانلود ناقص است؛ فایل موقت برای ادامه دانلود حفظ شد."
@@ -251,13 +320,17 @@ class ModelDownloader(context: Context) {
             }
 
             if (partialFile.length() < MIN_MODEL_SIZE) {
+
+                partialFile.delete()
+
                 throw IllegalStateException(
                     "حجم فایل مدل کمتر از حد مجاز است."
                 )
             }
 
-            // Check GGUF magic and version before installation.
+            // Validate GGUF header and version.
             if (!hasValidGgufHeader(partialFile)) {
+
                 partialFile.delete()
 
                 throw IllegalStateException(
@@ -265,15 +338,19 @@ class ModelDownloader(context: Context) {
                 )
             }
 
-            // Preserve any existing file until the new one is ready.
+            // Preserve the old file until installation succeeds.
             val hadOldFile = finalFile.exists()
 
-            if (hadOldFile && !finalFile.renameTo(backupFile)) {
+            if (
+                hadOldFile &&
+                !finalFile.renameTo(backupFile)
+            ) {
                 throw IllegalStateException(
                     "نگهداری نسخه قبلی مدل ناموفق بود."
                 )
             }
 
+            // Install the downloaded model.
             if (!partialFile.renameTo(finalFile)) {
 
                 if (hadOldFile) {
@@ -285,8 +362,8 @@ class ModelDownloader(context: Context) {
                 )
             }
 
-            // Verify the installed file once more.
-            if (!hasValidGgufHeader(finalFile)) {
+            // Validate the installed file.
+            if (!isCompleteModel(finalFile)) {
 
                 finalFile.delete()
 
@@ -299,18 +376,20 @@ class ModelDownloader(context: Context) {
                 )
             }
 
+            // Remove the old backup only after successful installation.
             if (backupFile.exists()) {
                 backupFile.delete()
             }
 
             onProgress(
-                finalFile.length(),
-                finalFile.length()
+                EXPECTED_MODEL_SIZE,
+                EXPECTED_MODEL_SIZE
             )
 
             finalFile
 
         } finally {
+
             connection?.disconnect()
         }
     }
