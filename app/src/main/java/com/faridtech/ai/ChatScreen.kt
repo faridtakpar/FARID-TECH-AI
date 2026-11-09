@@ -9,6 +9,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 
@@ -17,6 +18,7 @@ private data class ChatMessage(
     val isUser: Boolean
 )
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
     context: Context,
@@ -35,11 +37,16 @@ fun ChatScreen(
                 .forEach { line ->
                     try {
                         val parts = line.split(":", limit = 2)
+
                         if (parts.size == 2) {
                             val decoded = String(
-                                Base64.decode(parts[1], Base64.NO_WRAP),
+                                Base64.decode(
+                                    parts[1],
+                                    Base64.NO_WRAP
+                                ),
                                 Charsets.UTF_8
                             )
+
                             add(
                                 ChatMessage(
                                     decoded,
@@ -48,12 +55,14 @@ fun ChatScreen(
                             )
                         }
                     } catch (_: Exception) {
+                        // پیام خراب نادیده گرفته می‌شود.
                     }
                 }
         }
     }
 
     var input by remember { mutableStateOf("") }
+
     val listState = rememberLazyListState()
 
     fun saveHistory() {
@@ -66,7 +75,9 @@ fun ChatScreen(
             (if (message.isUser) "U:" else "A:") + encoded
         }
 
-        prefs.edit().putString("history", data).apply()
+        prefs.edit()
+            .putString("history", data)
+            .apply()
     }
 
     Scaffold(
@@ -91,7 +102,9 @@ fun ChatScreen(
             ) {
                 OutlinedTextField(
                     value = input,
-                    onValueChange = { input = it },
+                    onValueChange = {
+                        input = it
+                    },
                     modifier = Modifier.weight(1f),
                     placeholder = {
                         Text("پیام خود را بنویسید...")
@@ -102,15 +115,17 @@ fun ChatScreen(
                     onClick = {
                         if (input.isNotBlank()) {
                             messages.add(
-                                ChatMessage(input.trim(), true)
+                                ChatMessage(
+                                    input.trim(),
+                                    true
+                                )
                             )
+
                             input = ""
                             saveHistory()
                         }
                     },
-                    modifier = Modifier.align(
-                        androidx.compose.ui.Alignment.CenterVertically
-                    )
+                    modifier = Modifier.align(Alignment.CenterVertically)
                 ) {
                     Text("ارسال")
                 }
@@ -124,6 +139,7 @@ fun ChatScreen(
                 .padding(padding)
                 .padding(12.dp)
         ) {
+
             Text(
                 "دستیار هوشمند شخصی",
                 style = MaterialTheme.typography.titleLarge
@@ -145,13 +161,15 @@ fun ChatScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 items(messages) { message ->
+
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         colors = CardDefaults.cardColors(
-                            containerColor = if (message.isUser)
+                            containerColor = if (message.isUser) {
                                 MaterialTheme.colorScheme.primaryContainer
-                            else
+                            } else {
                                 MaterialTheme.colorScheme.surfaceVariant
+                            }
                         )
                     ) {
                         Text(
