@@ -41,6 +41,20 @@ class LocalAIEngine(private val context: Context) {
         }
     }
 
+    fun getModelDetails(): String {
+        return if (modelFile.exists() && modelFile.isFile) {
+            """
+            مسیر فایل:
+            ${modelFile.absolutePath}
+
+            حجم فایل:
+            ${modelFile.length() / (1024.0 * 1024.0)} MB
+            """.trimIndent()
+        } else {
+            "فایل مدل در مسیر مورد انتظار پیدا نشد."
+        }
+    }
+
     suspend fun generate(prompt: String): String {
         return withContext(Dispatchers.IO) {
 
