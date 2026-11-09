@@ -24,15 +24,20 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FaridTechAIApp() {
     var message by remember { mutableStateOf("") }
-    var messages by remember { mutableStateOf(listOf("سلام! من FARID TECH AI هستم.")) }
+    var messages by remember {
+        mutableStateOf(listOf("سلام! من FARID TECH AI هستم."))
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("FARID TECH AI") }
+                title = {
+                    Text("FARID TECH AI")
+                }
             )
         }
     ) { padding ->
@@ -54,7 +59,9 @@ fun FaridTechAIApp() {
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 items(messages) { item ->
-                    Card(modifier = Modifier.fillMaxWidth()) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
                         Text(
                             text = item,
                             modifier = Modifier.padding(12.dp)
@@ -70,7 +77,9 @@ fun FaridTechAIApp() {
                     value = message,
                     onValueChange = { message = it },
                     modifier = Modifier.weight(1f),
-                    placeholder = { Text("پیام خود را بنویسید...") }
+                    placeholder = {
+                        Text("پیام خود را بنویسید...")
+                    }
                 )
 
                 Spacer(modifier = Modifier.width(8.dp))
