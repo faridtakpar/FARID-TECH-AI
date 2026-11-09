@@ -2,6 +2,7 @@
 package com.faridtech.ai
 
 import android.content.Context
+import android.net.Uri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -16,10 +17,12 @@ class LocalAIEngine(private val context: Context) {
     }
 
     private val modelFile: File
-        get() = File(
-            context.getExternalFilesDir(null),
-            "models/$MODEL_NAME"
-        )
+        get() {
+            val directory = context.getExternalFilesDir(null)
+                ?: context.filesDir
+
+            return File(directory, "models/$MODEL_NAME")
+        }
 
     fun isModelAvailable(): Boolean {
         return modelFile.exists() &&
@@ -55,15 +58,106 @@ class LocalAIEngine(private val context: Context) {
         }
     }
 
+    suspend fun exportModelTo(uri: Uri): Boolean {
+        return withContext(Dispatchers.IO) {
+            if (!isModelAvailable()) {
+                return@withContext false
+            }
+
+            try {
+                val output = context.contentResolver
+                    .openOutputStream(uri, "w")
+                    ?: return@withContext false
+
+                output.use { destination ->
+                    modelFile.inputStream().use { source ->
+                        source.copyTo(destination)
+                    }
+                }
+
+                true
+            } catch (_: Exception) {
+                false
+            }
+        }
+    }
+
+    suspend fun importModelFrom(uri: Uri): Boolean {
+        return withContext(Dispatchers.IO) {
+            val parent = modelFile.parentFile
+                ?: return@withContext false
+
+            if (!parent.exists() && !parent.mkdirs()) {
+                return@withContext false
+            }
+
+            val temporaryFile = File(parent, "$MODEL_NAME.importing")
+            val backupFile = File(parent, "$MODEL_NAME.previous")
+
+            try {
+                val input = context.contentResolver
+                    .openInputStream(uri)
+                    ?: return@withContext false
+
+                input.use { source ->
+                    temporaryFile.outputStream().use { destination ->
+                        source.copyTo(destination)
+                    }
+                }
+
+                if (!temporaryFile.exists() ||
+                    temporaryFile.length() < MIN_MODEL_SIZE
+                ) {
+                    temporaryFile.delete()
+                    return@withContext false
+                }
+
+                if (backupFile.exists()) {
+                    backupFile.delete()
+                }
+
+                val hadOldModel = modelFile.exists()
+
+                if (hadOldModel && !modelFile.renameTo(backupFile)) {
+                    temporaryFile.delete()
+                    return@withContext false
+                }
+
+                if (!temporaryFile.renameTo(modelFile)) {
+                    if (hadOldModel) {
+                        backupFile.renameTo(modelFile)
+                    }
+
+                    temporaryFile.delete()
+                    return@withContext false
+                }
+
+                backupFile.delete()
+                true
+
+            } catch (_: Exception) {
+                temporaryFile.delete()
+
+                if (backupFile.exists() && !modelFile.exists()) {
+                    backupFile.renameTo(modelFile)
+                }
+
+                false
+            }
+        }
+    }
+
     suspend fun generate(prompt: String): String {
         return withContext(Dispatchers.IO) {
+            when {
+                prompt.isBlank() ->
+                    "لطفاً پیام خود را وارد کنید."
 
-            if (prompt.isBlank()) {
-                "لطفاً پیام خود را وارد کنید."
-            } else if (!isModelAvailable()) {
-                "مدل هوش مصنوعی هنوز نصب نشده است."
-            } else {
-                "فایل مدل شناسایی شد؛ موتور اجرای هوش مصنوعی هنوز متصل نشده است."
+                !isModelAvailable() ->
+                    "مدل هوش مصنوعی هنوز نصب نشده است."
+
+                else ->
+                    "فایل مدل شناسایی شد؛ موتور اجرای هوش مصنوعی هنوز متصل نشده است."
             }
         }
     }
