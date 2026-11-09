@@ -6,6 +6,7 @@ import android.net.Uri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.RandomAccessFile
 
 class LocalAIEngine(private val context: Context) {
 
@@ -17,6 +18,9 @@ class LocalAIEngine(private val context: Context) {
 
         private const val LOAD_SUCCESS =
             "مدل با موفقیت بارگذاری شد."
+
+        private const val GGUF_VERSION_MIN = 2
+        private const val GGUF_VERSION_MAX = 3
     }
 
     private val native = NativeLlama()
@@ -32,10 +36,47 @@ class LocalAIEngine(private val context: Context) {
             return File(directory, "models/$MODEL_NAME")
         }
 
+    private fun hasValidGgufHeader(file: File): Boolean {
+        if (!file.exists() || !file.isFile) {
+            return false
+        }
+
+        if (file.length() < MIN_MODEL_SIZE) {
+            return false
+        }
+
+        return try {
+            RandomAccessFile(file, "r").use { input ->
+
+                if (input.length() < 8L) {
+                    return@use false
+                }
+
+                val magic = ByteArray(4)
+                input.readFully(magic)
+
+                if (
+                    magic[0] != 'G'.code.toByte() ||
+                    magic[1] != 'G'.code.toByte() ||
+                    magic[2] != 'U'.code.toByte() ||
+                    magic[3] != 'F'.code.toByte()
+                ) {
+                    return@use false
+                }
+
+                val version = Integer.reverseBytes(
+                    input.readInt()
+                )
+
+                version in GGUF_VERSION_MIN..GGUF_VERSION_MAX
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     fun isModelAvailable(): Boolean {
-        return modelFile.exists() &&
-            modelFile.isFile &&
-            modelFile.length() >= MIN_MODEL_SIZE
+        return hasValidGgufHeader(modelFile)
     }
 
     suspend fun checkModel(): Boolean {
@@ -60,6 +101,9 @@ class LocalAIEngine(private val context: Context) {
 
             حجم فایل:
             ${modelFile.length() / (1024.0 * 1024.0)} MB
+
+            وضعیت سربرگ GGUF:
+            ${if (hasValidGgufHeader(modelFile)) "معتبر" else "نامعتبر"}
             """.trimIndent()
         } else {
             "فایل مدل در مسیر مورد انتظار پیدا نشد."
@@ -70,7 +114,7 @@ class LocalAIEngine(private val context: Context) {
         return withContext(Dispatchers.IO) {
 
             if (!isModelAvailable()) {
-                return@withContext "فایل مدل پیدا نشد یا حجم آن کافی نیست."
+                return@withContext "فایل مدل معتبر نیست یا حجم آن کافی نیست."
             }
 
             val path = modelFile.absolutePath
@@ -80,9 +124,6 @@ class LocalAIEngine(private val context: Context) {
             }
 
             try {
-                native.nativeRelease()
-                loadedModelPath = null
-
                 val result = native.nativeLoadModel(path)
 
                 if (result == LOAD_SUCCESS) {
@@ -106,20 +147,19 @@ class LocalAIEngine(private val context: Context) {
             }
 
             if (!isModelAvailable()) {
-                return@withContext "مدل هوش مصنوعی هنوز نصب نشده است."
+                return@withContext "فایل مدل معتبر نیست یا نصب نشده است."
             }
 
             try {
                 val path = modelFile.absolutePath
 
                 if (loadedModelPath != path) {
-                    native.nativeRelease()
-                    loadedModelPath = null
 
                     val loadResult =
                         native.nativeLoadModel(path)
 
                     if (loadResult != LOAD_SUCCESS) {
+                        loadedModelPath = null
                         return@withContext loadResult
                     }
 
@@ -197,25 +237,21 @@ class LocalAIEngine(private val context: Context) {
                     }
                 }
 
-                if (!temporaryFile.exists() ||
-                    temporaryFile.length() < MIN_MODEL_SIZE
-                ) {
+                // Validate the new file before touching the current model.
+                if (!hasValidGgufHeader(temporaryFile)) {
                     temporaryFile.delete()
                     return@withContext false
                 }
 
+                // Preserve an existing backup rather than overwriting it.
                 if (backupFile.exists()) {
                     temporaryFile.delete()
                     return@withContext false
                 }
 
-                releaseModel()
-
                 val hadOldModel = modelFile.exists()
 
-                if (hadOldModel &&
-                    !modelFile.renameTo(backupFile)
-                ) {
+                if (hadOldModel && !modelFile.renameTo(backupFile)) {
                     temporaryFile.delete()
                     return@withContext false
                 }
@@ -228,6 +264,13 @@ class LocalAIEngine(private val context: Context) {
 
                     temporaryFile.delete()
                     return@withContext false
+                }
+
+                // The new file is installed; release the old in-memory model.
+                try {
+                    native.nativeRelease()
+                } finally {
+                    loadedModelPath = null
                 }
 
                 if (backupFile.exists()) {
