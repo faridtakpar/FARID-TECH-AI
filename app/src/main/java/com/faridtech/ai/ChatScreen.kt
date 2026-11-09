@@ -3,141 +3,366 @@ package com.faridtech.ai
 
 import android.content.Context
 import android.net.Uri
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import java.io.File
+import android.util.Base64
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
 
-class LocalAIEngine(private val context: Context) {
+private data class ChatMessage(
+    val text: String,
+    val isUser: Boolean
+)
 
-    companion object {
-        private const val MODEL_NAME =
-            "Qwen2.5-Coder-1.5B-Q4_K_M.gguf"
-
-        private const val MIN_MODEL_SIZE = 500_000_000L
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ChatScreen(
+    context: Context,
+    onBack: () -> Unit
+) {
+    val prefs = remember {
+        context.getSharedPreferences("farid_chat", Context.MODE_PRIVATE)
     }
 
-    private val modelFile: File
-        get() {
-            val directory = context.getExternalFilesDir(null)
-                ?: context.filesDir
+    val downloader = remember { ModelDownloader(context) }
+    val engine = remember { LocalAIEngine(context) }
+    val scope = rememberCoroutineScope()
 
-            return File(directory, "models/$MODEL_NAME")
-        }
+    val messages = remember {
+        mutableStateListOf<ChatMessage>().apply {
+            val saved = prefs.getString("history", "") ?: ""
 
-    fun isModelAvailable(): Boolean {
-        return modelFile.exists() &&
-            modelFile.isFile &&
-            modelFile.length() >= MIN_MODEL_SIZE
-    }
-
-    suspend fun checkModel(): Boolean {
-        return withContext(Dispatchers.IO) {
-            isModelAvailable()
-        }
-    }
-
-    fun getModelPath(): String? {
-        return if (isModelAvailable()) {
-            modelFile.absolutePath
-        } else {
-            null
-        }
-    }
-
-    fun getModelDetails(): String {
-        return if (modelFile.exists() && modelFile.isFile) {
-            """
-            مسیر فایل:
-            ${modelFile.absolutePath}
-
-            حجم فایل:
-            ${modelFile.length() / (1024.0 * 1024.0)} MB
-            """.trimIndent()
-        } else {
-            "فایل مدل در مسیر مورد انتظار پیدا نشد."
-        }
-    }
-
-    suspend fun exportModelTo(uri: Uri): Boolean {
-        return withContext(Dispatchers.IO) {
-            if (!isModelAvailable()) {
-                return@withContext false
-            }
-
-            val output = context.contentResolver
-                .openOutputStream(uri, "w")
-                ?: return@withContext false
-
-            output.use { destination ->
-                modelFile.inputStream().use { source ->
-                    source.copyTo(destination)
+            saved.lines()
+                .filter { it.isNotBlank() }
+                .forEach { line ->
+                    try {
+                        val parts = line.split(":", limit = 2)
+                        if (parts.size == 2) {
+                            val decoded = String(
+                                Base64.decode(parts[1], Base64.NO_WRAP),
+                                Charsets.UTF_8
+                            )
+                            add(ChatMessage(decoded, parts[0] == "U"))
+                        }
+                    } catch (_: Exception) {
+                    }
                 }
-            }
-
-            true
         }
     }
 
-    suspend fun importModelFrom(uri: Uri): Boolean {
-        return withContext(Dispatchers.IO) {
-            val parent = modelFile.parentFile
-                ?: return@withContext false
+    var input by remember { mutableStateOf("") }
+    var downloading by remember { mutableStateOf(false) }
+    var transferring by remember { mutableStateOf(false) }
+    var modelReady by remember { mutableStateOf(false) }
+    var downloadProgress by remember { mutableStateOf(0) }
 
-            if (!parent.exists() && !parent.mkdirs()) {
-                return@withContext false
+    var downloadStatus by remember {
+        mutableStateOf("در حال بررسی مدل...")
+    }
+
+    var nativeStatus by remember {
+        mutableStateOf("در حال آزمایش ارتباط با موتور بومی...")
+    }
+
+    val listState = rememberLazyListState()
+
+    fun saveHistory() {
+        val data = messages.joinToString("\n") { message ->
+            val encoded = Base64.encodeToString(
+                message.text.toByteArray(Charsets.UTF_8),
+                Base64.NO_WRAP
+            )
+            (if (message.isUser) "U:" else "A:") + encoded
+        }
+        prefs.edit().putString("history", data).apply()
+    }
+
+    val backupLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument(
+            "application/octet-stream"
+        )
+    ) { uri: Uri? ->
+        if (uri != null) {
+            scope.launch {
+                transferring = true
+                downloadStatus = "در حال ساخت نسخه پشتیبان..."
+
+                val success = try {
+                    engine.exportModelTo(uri)
+                } catch (_: Exception) {
+                    false
+                }
+
+                downloadStatus = if (success) {
+                    "نسخه پشتیبان مدل ذخیره شد."
+                } else {
+                    "ذخیره نسخه پشتیبان ناموفق بود."
+                }
+
+                transferring = false
             }
+        }
+    }
 
-            val temporaryFile = File(parent, "$MODEL_NAME.tmp")
+    val restoreLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            scope.launch {
+                transferring = true
+                downloadStatus = "در حال بازیابی مدل..."
+
+                val success = try {
+                    engine.importModelFrom(uri)
+                } catch (_: Exception) {
+                    false
+                }
+
+                modelReady = engine.checkModel()
+
+                downloadStatus = if (success && modelReady) {
+                    "مدل با موفقیت بازیابی شد."
+                } else {
+                    "بازیابی ناموفق بود؛ فایل را بررسی کنید."
+                }
+
+                transferring = false
+            }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        modelReady = engine.checkModel()
+
+        downloadStatus = if (modelReady) {
+            "مدل روی گوشی نصب است."
+        } else {
+            "برای استفاده آفلاین، ابتدا مدل را دانلود کنید."
+        }
+
+        nativeStatus = try {
+            val result = NativeLlama().nativeBridgeCheck()
+
+            if (result == "FARID TECH AI Native Bridge is ready") {
+                "اتصال Kotlin و C++ با موفقیت برقرار شد."
+            } else {
+                "پاسخ غیرمنتظره از موتور بومی: $result"
+            }
+        } catch (e: Throwable) {
+            "خطا در اتصال موتور بومی: ${e.message ?: e.javaClass.simpleName}"
+        }
+    }
+
+    fun startDownload() {
+        if (downloading || modelReady || transferring) return
+
+        scope.launch {
+            downloading = true
+            downloadStatus = "در حال دانلود مدل..."
+            downloadProgress = 0
 
             try {
-                val input = context.contentResolver
-                    .openInputStream(uri)
-                    ?: return@withContext false
-
-                input.use { source ->
-                    temporaryFile.outputStream().use { destination ->
-                        source.copyTo(destination)
+                downloader.download { downloaded, total ->
+                    if (total > 0) {
+                        downloadProgress =
+                            ((downloaded * 100) / total)
+                                .toInt()
+                                .coerceIn(0, 100)
                     }
                 }
 
-                if (!temporaryFile.exists() ||
-                    temporaryFile.length() < MIN_MODEL_SIZE
-                ) {
-                    temporaryFile.delete()
-                    return@withContext false
+                modelReady = engine.checkModel()
+                downloadProgress = 100
+
+                downloadStatus = if (modelReady) {
+                    "مدل با موفقیت دانلود شد."
+                } else {
+                    "فایل دریافت شد اما معتبر نیست."
                 }
-
-                if (modelFile.exists() && !modelFile.delete()) {
-                    temporaryFile.delete()
-                    return@withContext false
-                }
-
-                val renamed = temporaryFile.renameTo(modelFile)
-
-                if (!renamed) {
-                    temporaryFile.delete()
-                }
-
-                renamed
-            } catch (_: Exception) {
-                temporaryFile.delete()
-                false
+            } catch (e: Exception) {
+                downloadStatus =
+                    "دانلود ناموفق بود: ${e.message ?: "خطای نامشخص"}"
+            } finally {
+                downloading = false
             }
         }
     }
 
-    suspend fun generate(prompt: String): String {
-        return withContext(Dispatchers.IO) {
-            when {
-                prompt.isBlank() ->
-                    "لطفاً پیام خود را وارد کنید."
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("FARID TECH AI") },
+                navigationIcon = {
+                    TextButton(onClick = onBack) {
+                        Text("بازگشت")
+                    }
+                }
+            )
+        },
+        bottomBar = {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedTextField(
+                    value = input,
+                    onValueChange = { input = it },
+                    modifier = Modifier.weight(1f),
+                    placeholder = {
+                        Text("پیام خود را بنویسید...")
+                    }
+                )
 
-                !isModelAvailable() ->
-                    "مدل هوش مصنوعی هنوز نصب نشده است."
-
-                else ->
-                    "فایل مدل شناسایی شد؛ موتور اجرای هوش مصنوعی هنوز متصل نشده است."
+                Button(
+                    onClick = {
+                        if (input.isNotBlank()) {
+                            messages.add(ChatMessage(input.trim(), true))
+                            input = ""
+                            saveHistory()
+                        }
+                    },
+                    modifier = Modifier.align(Alignment.CenterVertically)
+                ) {
+                    Text("ارسال")
+                }
             }
+        }
+    ) { padding ->
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(12.dp)
+        ) {
+
+            Text(
+                "دستیار هوشمند شخصی",
+                style = MaterialTheme.typography.titleLarge
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        "وضعیت اتصال موتور بومی",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(nativeStatus)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        "موتور هوش مصنوعی آفلاین",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+
+                    Text(downloadStatus)
+
+                    if (downloading) {
+                        LinearProgressIndicator(
+                            progress = { downloadProgress / 100f },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Text("$downloadProgress٪")
+                    }
+
+                    Button(
+                        onClick = { startDownload() },
+                        enabled = !downloading && !modelReady && !transferring,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            if (modelReady) "مدل آماده است"
+                            else if (downloading) "در حال دانلود..."
+                            else "دانلود مدل آفلاین"
+                        )
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            backupLauncher.launch(
+                                "FARID-TECH-Qwen2.5-Coder-1.5B.gguf"
+                            )
+                        },
+                        enabled = modelReady && !downloading && !transferring,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("پشتیبان‌گیری از مدل")
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            restoreLauncher.launch(
+                                arrayOf("*/*")
+                            )
+                        },
+                        enabled = !downloading && !transferring,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("بازیابی مدل از فایل")
+                    }
+
+                    if (transferring) {
+                        LinearProgressIndicator(
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            LazyColumn(
+                modifier = Modifier.weight(1f),
+                state = listState,
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(messages) { message ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (message.isUser) {
+                                MaterialTheme.colorScheme.primaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.surfaceVariant
+                            }
+                        )
+                    ) {
+                        Text(
+                            text = message.text,
+                            modifier = Modifier.padding(14.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(messages.size) {
+        if (messages.isNotEmpty()) {
+            listState.animateScrollToItem(messages.lastIndex)
         }
     }
 }
