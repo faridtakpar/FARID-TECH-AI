@@ -26,7 +26,8 @@ private data class ChatMessage(
 @Composable
 fun ChatScreen(
     context: Context,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onExternalPickerStateChanged: (Boolean) -> Unit
 ) {
     val prefs = remember {
         context.getSharedPreferences(
@@ -110,6 +111,8 @@ fun ChatScreen(
         )
     ) { uri: Uri? ->
 
+        onExternalPickerStateChanged(false)
+
         if (uri != null) {
             scope.launch {
                 transferring = true
@@ -135,6 +138,8 @@ fun ChatScreen(
     val restoreLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
+
+        onExternalPickerStateChanged(false)
 
         if (uri != null) {
             scope.launch {
@@ -423,6 +428,8 @@ fun ChatScreen(
 
                     OutlinedButton(
                         onClick = {
+                            onExternalPickerStateChanged(true)
+
                             backupLauncher.launch(
                                 "FARID-TECH-Qwen2.5-Coder-1.5B.gguf"
                             )
@@ -438,6 +445,8 @@ fun ChatScreen(
 
                     OutlinedButton(
                         onClick = {
+                            onExternalPickerStateChanged(true)
+
                             restoreLauncher.launch(
                                 arrayOf("*/*")
                             )
