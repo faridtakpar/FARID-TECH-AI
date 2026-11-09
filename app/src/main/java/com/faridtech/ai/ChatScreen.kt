@@ -29,7 +29,10 @@ fun ChatScreen(
     onBack: () -> Unit
 ) {
     val prefs = remember {
-        context.getSharedPreferences("farid_chat", Context.MODE_PRIVATE)
+        context.getSharedPreferences(
+            "farid_chat",
+            Context.MODE_PRIVATE
+        )
     }
 
     val downloader = remember { ModelDownloader(context) }
@@ -45,12 +48,22 @@ fun ChatScreen(
                 .forEach { line ->
                     try {
                         val parts = line.split(":", limit = 2)
+
                         if (parts.size == 2) {
                             val decoded = String(
-                                Base64.decode(parts[1], Base64.NO_WRAP),
+                                Base64.decode(
+                                    parts[1],
+                                    Base64.NO_WRAP
+                                ),
                                 Charsets.UTF_8
                             )
-                            add(ChatMessage(decoded, parts[0] == "U"))
+
+                            add(
+                                ChatMessage(
+                                    decoded,
+                                    parts[0] == "U"
+                                )
+                            )
                         }
                     } catch (_: Exception) {
                     }
@@ -61,6 +74,8 @@ fun ChatScreen(
     var input by remember { mutableStateOf("") }
     var downloading by remember { mutableStateOf(false) }
     var transferring by remember { mutableStateOf(false) }
+    var generating by remember { mutableStateOf(false) }
+
     var modelReady by remember { mutableStateOf(false) }
     var downloadProgress by remember { mutableStateOf(0) }
 
@@ -69,7 +84,7 @@ fun ChatScreen(
     }
 
     var nativeStatus by remember {
-        mutableStateOf("در حال آزمایش ارتباط با موتور بومی...")
+        mutableStateOf("در حال بررسی موتور بومی...")
     }
 
     val listState = rememberLazyListState()
@@ -80,9 +95,13 @@ fun ChatScreen(
                 message.text.toByteArray(Charsets.UTF_8),
                 Base64.NO_WRAP
             )
+
             (if (message.isUser) "U:" else "A:") + encoded
         }
-        prefs.edit().putString("history", data).apply()
+
+        prefs.edit()
+            .putString("history", data)
+            .apply()
     }
 
     val backupLauncher = rememberLauncherForActivityResult(
@@ -90,6 +109,7 @@ fun ChatScreen(
             "application/octet-stream"
         )
     ) { uri: Uri? ->
+
         if (uri != null) {
             scope.launch {
                 transferring = true
@@ -115,6 +135,7 @@ fun ChatScreen(
     val restoreLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
+
         if (uri != null) {
             scope.launch {
                 transferring = true
@@ -143,7 +164,7 @@ fun ChatScreen(
         modelReady = engine.checkModel()
 
         downloadStatus = if (modelReady) {
-            "مدل روی گوشی نصب است."
+            "فایل مدل روی گوشی موجود است."
         } else {
             "برای استفاده آفلاین، ابتدا مدل را دانلود کنید."
         }
@@ -152,17 +173,21 @@ fun ChatScreen(
             val result = NativeLlama().nativeBridgeCheck()
 
             if (result == "FARID TECH AI Native Bridge is ready") {
-                "اتصال Kotlin و C++ با موفقیت برقرار شد."
+                "ارتباط Kotlin و C++ برقرار است."
             } else {
                 "پاسخ غیرمنتظره از موتور بومی: $result"
             }
         } catch (e: Throwable) {
-            "خطا در اتصال موتور بومی: ${e.message ?: e.javaClass.simpleName}"
+            "خطا در اتصال موتور بومی: ${
+                e.message ?: e.javaClass.simpleName
+            }"
         }
     }
 
     fun startDownload() {
-        if (downloading || modelReady || transferring) return
+        if (downloading || modelReady || transferring || generating) {
+            return
+        }
 
         scope.launch {
             downloading = true
@@ -183,15 +208,83 @@ fun ChatScreen(
                 downloadProgress = 100
 
                 downloadStatus = if (modelReady) {
-                    "مدل با موفقیت دانلود شد."
+                    "دانلود فایل مدل تمام شد."
                 } else {
-                    "فایل دریافت شد اما معتبر نیست."
+                    "فایل دریافت شد اما حجم آن کافی نیست."
                 }
+
             } catch (e: Exception) {
                 downloadStatus =
-                    "دانلود ناموفق بود: ${e.message ?: "خطای نامشخص"}"
+                    "دانلود ناموفق بود: ${
+                        e.message ?: "خطای نامشخص"
+                    }"
+
             } finally {
                 downloading = false
+            }
+        }
+    }
+
+    fun sendMessage() {
+        val userPrompt = input.trim()
+
+        if (
+            userPrompt.isBlank() ||
+            generating ||
+            downloading ||
+            transferring
+        ) {
+            return
+        }
+
+        if (!modelReady) {
+            downloadStatus = "ابتدا فایل مدل را دانلود یا بازیابی کنید."
+            return
+        }
+
+        messages.add(
+            ChatMessage(userPrompt, true)
+        )
+
+        input = ""
+        saveHistory()
+
+        scope.launch {
+            generating = true
+            nativeStatus = "در حال آماده‌سازی پاسخ..."
+
+            try {
+                val formattedPrompt =
+                    "<|im_start|>user\n" +
+                    userPrompt +
+                    "\n<|im_end|>\n" +
+                    "<|im_start|>assistant\n"
+
+                val response = engine.generate(formattedPrompt)
+
+                messages.add(
+                    ChatMessage(response, false)
+                )
+
+                saveHistory()
+
+                nativeStatus = "پاسخ‌گویی موتور محلی انجام شد."
+
+            } catch (e: Exception) {
+                val error =
+                    "خطا در تولید پاسخ: ${
+                        e.message ?: "خطای نامشخص"
+                    }"
+
+                messages.add(
+                    ChatMessage(error, false)
+                )
+
+                saveHistory()
+                nativeStatus = error
+
+            } finally {
+                generating = false
             }
         }
     }
@@ -199,7 +292,9 @@ fun ChatScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("FARID TECH AI") },
+                title = {
+                    Text("FARID TECH AI")
+                },
                 navigationIcon = {
                     TextButton(onClick = onBack) {
                         Text("بازگشت")
@@ -214,9 +309,11 @@ fun ChatScreen(
                     .padding(12.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+
                 OutlinedTextField(
                     value = input,
                     onValueChange = { input = it },
+                    enabled = !generating && !downloading && !transferring,
                     modifier = Modifier.weight(1f),
                     placeholder = {
                         Text("پیام خود را بنویسید...")
@@ -224,16 +321,18 @@ fun ChatScreen(
                 )
 
                 Button(
-                    onClick = {
-                        if (input.isNotBlank()) {
-                            messages.add(ChatMessage(input.trim(), true))
-                            input = ""
-                            saveHistory()
-                        }
-                    },
-                    modifier = Modifier.align(Alignment.CenterVertically)
+                    onClick = { sendMessage() },
+                    enabled = input.isNotBlank() &&
+                        !generating &&
+                        !downloading &&
+                        !transferring,
+                    modifier = Modifier.align(
+                        Alignment.CenterVertically
+                    )
                 ) {
-                    Text("ارسال")
+                    Text(
+                        if (generating) "..." else "ارسال"
+                    )
                 }
             }
         }
@@ -253,7 +352,9 @@ fun ChatScreen(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            Card(modifier = Modifier.fillMaxWidth()) {
+            Card(
+                modifier = Modifier.fillMaxWidth()
+            ) {
                 Column(
                     modifier = Modifier.padding(12.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -262,17 +363,29 @@ fun ChatScreen(
                         "وضعیت اتصال موتور بومی",
                         style = MaterialTheme.typography.titleMedium
                     )
+
                     Text(nativeStatus)
+
+                    if (generating) {
+                        LinearProgressIndicator(
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        Text("هوش مصنوعی در حال پاسخ‌گویی است...")
+                    }
                 }
             }
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            Card(modifier = Modifier.fillMaxWidth()) {
+            Card(
+                modifier = Modifier.fillMaxWidth()
+            ) {
                 Column(
                     modifier = Modifier.padding(12.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+
                     Text(
                         "موتور هوش مصنوعی آفلاین",
                         style = MaterialTheme.typography.titleMedium
@@ -282,21 +395,29 @@ fun ChatScreen(
 
                     if (downloading) {
                         LinearProgressIndicator(
-                            progress = { downloadProgress / 100f },
+                            progress = {
+                                downloadProgress / 100f
+                            },
                             modifier = Modifier.fillMaxWidth()
                         )
+
                         Text("$downloadProgress٪")
                     }
 
                     Button(
                         onClick = { startDownload() },
-                        enabled = !downloading && !modelReady && !transferring,
+                        enabled = !downloading &&
+                            !modelReady &&
+                            !transferring &&
+                            !generating,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
-                            if (modelReady) "مدل آماده است"
-                            else if (downloading) "در حال دانلود..."
-                            else "دانلود مدل آفلاین"
+                            when {
+                                modelReady -> "فایل مدل موجود است"
+                                downloading -> "در حال دانلود..."
+                                else -> "دانلود مدل آفلاین"
+                            }
                         )
                     }
 
@@ -306,7 +427,10 @@ fun ChatScreen(
                                 "FARID-TECH-Qwen2.5-Coder-1.5B.gguf"
                             )
                         },
-                        enabled = modelReady && !downloading && !transferring,
+                        enabled = modelReady &&
+                            !downloading &&
+                            !transferring &&
+                            !generating,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text("پشتیبان‌گیری از مدل")
@@ -318,7 +442,9 @@ fun ChatScreen(
                                 arrayOf("*/*")
                             )
                         },
-                        enabled = !downloading && !transferring,
+                        enabled = !downloading &&
+                            !transferring &&
+                            !generating,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text("بازیابی مدل از فایل")
@@ -339,15 +465,18 @@ fun ChatScreen(
                 state = listState,
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+
                 items(messages) { message ->
+
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         colors = CardDefaults.cardColors(
-                            containerColor = if (message.isUser) {
-                                MaterialTheme.colorScheme.primaryContainer
-                            } else {
-                                MaterialTheme.colorScheme.surfaceVariant
-                            }
+                            containerColor =
+                                if (message.isUser) {
+                                    MaterialTheme.colorScheme.primaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceVariant
+                                }
                         )
                     ) {
                         Text(
@@ -362,7 +491,9 @@ fun ChatScreen(
 
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(messages.lastIndex)
+            listState.animateScrollToItem(
+                messages.lastIndex
+            )
         }
     }
 }
