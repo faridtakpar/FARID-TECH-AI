@@ -81,6 +81,11 @@ fun ChatScreen(
                     } catch (_: Exception) {
                     }
                 }
+
+            // Keep only the latest 100 messages.
+            while (size > 100) {
+                removeAt(0)
+            }
         }
     }
 
@@ -118,8 +123,12 @@ fun ChatScreen(
 
     val listState = rememberLazyListState()
 
-    // Save chat history.
+    // Save chat history with a maximum of 100 messages.
     fun saveHistory() {
+
+        while (messages.size > 100) {
+            messages.removeAt(0)
+        }
 
         val data = messages.joinToString("\n") { message ->
 
@@ -193,12 +202,10 @@ fun ChatScreen(
 
         val normalized = response.trim()
 
-        // All native C++ errors use this prefix.
         if (normalized.startsWith("خطا:")) {
             return true
         }
 
-        // Errors returned by LocalAIEngine.
         val errorPrefixes = listOf(
             "فایل مدل معتبر نیست",
             "فایل مدل معتبر نیست یا نصب نشده است",
