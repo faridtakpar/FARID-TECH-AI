@@ -7,8 +7,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -36,9 +36,14 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 OwnerAccessScreen(
                     security = security,
+                    context = this,
                     unlocked = ownerUnlocked,
-                    onUnlock = { ownerUnlocked = true },
-                    onLock = { ownerUnlocked = false }
+                    onUnlock = {
+                        ownerUnlocked = true
+                    },
+                    onLock = {
+                        ownerUnlocked = false
+                    }
                 )
             }
         }
@@ -53,6 +58,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun OwnerAccessScreen(
     security: OwnerSecurity,
+    context: android.content.Context,
     unlocked: Boolean,
     onUnlock: () -> Unit,
     onLock: () -> Unit
@@ -60,25 +66,53 @@ fun OwnerAccessScreen(
     var password by remember { mutableStateOf("") }
     var confirmPassword by remember { mutableStateOf("") }
     var error by remember { mutableStateOf("") }
-    var configured by remember { mutableStateOf(security.isConfigured()) }
-    var selectedSection by remember { mutableStateOf<String?>(null) }
+    var configured by remember {
+        mutableStateOf(security.isConfigured())
+    }
+    var selectedSection by remember {
+        mutableStateOf<String?>(null)
+    }
 
-    if (unlocked) {
-        if (selectedSection == null) {
-            OwnerDashboard(
-                onSelect = { selectedSection = it },
-                onLock = onLock
-            )
-        } else {
-            SectionScreen(
-                title = selectedSection!!,
-                onBack = { selectedSection = null }
-            )
-        }
-    } else {
-        LaunchedEffect(unlocked) {
+    LaunchedEffect(unlocked) {
+        if (!unlocked) {
             selectedSection = null
         }
+    }
+
+    if (unlocked) {
+
+        when (selectedSection) {
+
+            "هوش مصنوعی محلی",
+            "هوش مصنوعی آنلاین" -> {
+                ChatScreen(
+                    context = context,
+                    onBack = {
+                        selectedSection = null
+                    }
+                )
+            }
+
+            null -> {
+                OwnerDashboard(
+                    onSelect = {
+                        selectedSection = it
+                    },
+                    onLock = onLock
+                )
+            }
+
+            else -> {
+                SectionScreen(
+                    title = selectedSection ?: "",
+                    onBack = {
+                        selectedSection = null
+                    }
+                )
+            }
+        }
+
+    } else {
 
         Column(
             modifier = Modifier
@@ -87,6 +121,7 @@ fun OwnerAccessScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
+
             Text(
                 "FARID TECH AI",
                 style = MaterialTheme.typography.headlineMedium
@@ -95,7 +130,8 @@ fun OwnerAccessScreen(
             Spacer(modifier = Modifier.height(20.dp))
 
             Text(
-                if (configured) "ورود مالک" else "تنظیم رمز مالک",
+                if (configured) "ورود مالک"
+                else "تنظیم رمز مالک",
                 style = MaterialTheme.typography.titleLarge
             )
 
@@ -107,7 +143,9 @@ fun OwnerAccessScreen(
                     password = it
                     error = ""
                 },
-                label = { Text("رمز شخصی مالک") },
+                label = {
+                    Text("رمز شخصی مالک")
+                },
                 visualTransformation = PasswordVisualTransformation(),
                 keyboardOptions = KeyboardOptions(
                     keyboardType = KeyboardType.Password
@@ -116,6 +154,7 @@ fun OwnerAccessScreen(
             )
 
             if (!configured) {
+
                 Spacer(modifier = Modifier.height(12.dp))
 
                 OutlinedTextField(
@@ -124,7 +163,9 @@ fun OwnerAccessScreen(
                         confirmPassword = it
                         error = ""
                     },
-                    label = { Text("تکرار رمز شخصی") },
+                    label = {
+                        Text("تکرار رمز شخصی")
+                    },
                     visualTransformation = PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(
                         keyboardType = KeyboardType.Password
@@ -137,18 +178,24 @@ fun OwnerAccessScreen(
 
             Button(
                 onClick = {
+
                     if (configured) {
+
                         if (security.verifyPassword(password)) {
                             onUnlock()
                             error = ""
                         } else {
-                            error = if (security.remainingLockMillis() > 0) {
+                            error = if (
+                                security.remainingLockMillis() > 0
+                            ) {
                                 "ورود موقتاً قفل شده است."
                             } else {
                                 "رمز واردشده صحیح نیست."
                             }
                         }
+
                     } else {
+
                         when {
                             password.length < 12 ->
                                 error = "رمز باید حداقل ۱۲ کاراکتر باشد."
@@ -171,11 +218,15 @@ fun OwnerAccessScreen(
                     confirmPassword = ""
                 }
             ) {
-                Text(if (configured) "ورود امن" else "ثبت رمز مالک")
+                Text(
+                    if (configured) "ورود امن"
+                    else "ثبت رمز مالک"
+                )
             }
 
             if (error.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(12.dp))
+
                 Text(
                     text = error,
                     color = MaterialTheme.colorScheme.error
@@ -197,6 +248,7 @@ fun OwnerDashboard(
             .padding(20.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
+
         Text(
             "FARID TECH AI",
             style = MaterialTheme.typography.headlineMedium
@@ -212,37 +264,49 @@ fun OwnerDashboard(
         DashboardCard(
             "🔐 امنیت و مدیریت مالک",
             "مدیریت دسترسی و وضعیت امنیتی",
-            onClick = { onSelect("امنیت و مدیریت مالک") }
+            onClick = {
+                onSelect("امنیت و مدیریت مالک")
+            }
         )
 
         DashboardCard(
             "🧠 هوش مصنوعی محلی",
-            "اجرای مدل هوش مصنوعی روی دستگاه",
-            onClick = { onSelect("هوش مصنوعی محلی") }
+            "ورود به محیط گفت‌وگو و آماده‌سازی مدل آفلاین",
+            onClick = {
+                onSelect("هوش مصنوعی محلی")
+            }
         )
 
         DashboardCard(
             "🌐 هوش مصنوعی آنلاین",
-            "اتصال به سرویس‌های آنلاین",
-            onClick = { onSelect("هوش مصنوعی آنلاین") }
+            "ورود به محیط گفت‌وگو و آماده‌سازی اتصال آنلاین",
+            onClick = {
+                onSelect("هوش مصنوعی آنلاین")
+            }
         )
 
         DashboardCard(
             "💻 برنامه‌نویسی و توسعه",
             "ابزارهای ساخت اپلیکیشن و وب‌سایت",
-            onClick = { onSelect("برنامه‌نویسی و توسعه") }
+            onClick = {
+                onSelect("برنامه‌نویسی و توسعه")
+            }
         )
 
         DashboardCard(
             "🛡 ابزارهای امنیتی مجاز",
             "بررسی امنیت سامانه‌های مجاز",
-            onClick = { onSelect("ابزارهای امنیتی مجاز") }
+            onClick = {
+                onSelect("ابزارهای امنیتی مجاز")
+            }
         )
 
         DashboardCard(
             "⚙ تنظیمات و حافظه هوشمند",
             "تنظیمات برنامه و مدیریت حافظه",
-            onClick = { onSelect("تنظیمات و حافظه هوشمند") }
+            onClick = {
+                onSelect("تنظیمات و حافظه هوشمند")
+            }
         )
 
         Spacer(modifier = Modifier.height(20.dp))
@@ -295,6 +359,7 @@ fun SectionScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
+
         Text(
             title,
             style = MaterialTheme.typography.headlineSmall
@@ -302,7 +367,9 @@ fun SectionScreen(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        Text("این بخش در مراحل بعدی توسعه فعال خواهد شد.")
+        Text(
+            "این بخش در مراحل بعدی توسعه فعال خواهد شد."
+        )
 
         Spacer(modifier = Modifier.height(24.dp))
 
