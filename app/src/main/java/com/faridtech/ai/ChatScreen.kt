@@ -137,9 +137,6 @@ fun ChatScreen(
     }
 
     // Build a recent conversation prompt.
-    // Keep the prompt conservative because the model
-    // has a context size of 2048 tokens.
-
     fun buildConversationPrompt(): String {
 
         val systemMessage =
@@ -191,18 +188,23 @@ fun ChatScreen(
         }
     }
 
-    // Recognize known engine errors instead of
-    // reporting them as successful AI responses.
-
+    // Recognize native and Kotlin engine errors.
     fun isEngineError(response: String): Boolean {
 
+        val normalized = response.trim()
+
+        // All native C++ errors use this prefix.
+        if (normalized.startsWith("خطا:")) {
+            return true
+        }
+
+        // Errors returned by LocalAIEngine.
         val errorPrefixes = listOf(
             "فایل مدل معتبر نیست",
             "فایل مدل معتبر نیست یا نصب نشده است",
             "ابتدا باید مدل را بارگذاری کنی",
             "بارگذاری مدل ناموفق",
             "ساخت محیط اجرای مدل ناموفق",
-            "خطای غیرمنتظره هنگام بارگذاری مدل",
             "طول پیام برای تبدیل",
             "پیام برای ظرفیت فعلی مدل",
             "تبدیل پیام به توکن ناموفق",
@@ -216,12 +218,12 @@ fun ChatScreen(
             "پردازش توکن خروجی ناموفق",
             "تبدیل توکن خروجی به متن ناموفق",
             "مدل پاسخی تولید نکرد",
-            "خطای غیرمنتظره هنگام تولید پاسخ",
-            "خطا در اجرای هوش مصنوعی"
+            "خطا در اجرای هوش مصنوعی",
+            "لطفاً پیام خود را وارد کنید."
         )
 
         return errorPrefixes.any {
-            response.startsWith(it)
+            normalized.startsWith(it)
         }
     }
 
