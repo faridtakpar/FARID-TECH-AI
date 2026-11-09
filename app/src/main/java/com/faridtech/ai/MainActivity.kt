@@ -69,9 +69,18 @@ fun OwnerAccessScreen(
     onUnlock: () -> Unit,
     onLock: () -> Unit
 ) {
-    var password by remember { mutableStateOf("") }
-    var confirmPassword by remember { mutableStateOf("") }
-    var error by remember { mutableStateOf("") }
+
+    var password by remember {
+        mutableStateOf("")
+    }
+
+    var confirmPassword by remember {
+        mutableStateOf("")
+    }
+
+    var error by remember {
+        mutableStateOf("")
+    }
 
     var configured by remember {
         mutableStateOf(security.isConfigured())
@@ -82,10 +91,12 @@ fun OwnerAccessScreen(
     }
 
     LaunchedEffect(unlocked) {
+
         if (!unlocked) {
             selectedSection = null
             password = ""
             confirmPassword = ""
+            error = ""
         }
     }
 
@@ -93,14 +104,15 @@ fun OwnerAccessScreen(
 
         when (selectedSection) {
 
-            "هوش مصنوعی محلی",
-            "هوش مصنوعی آنلاین" -> {
+            "هوش مصنوعی محلی" -> {
+
                 ChatScreen(
                     context = context,
                     onBack = {
                         selectedSection = null
                     },
                     onExternalPickerStateChanged = { isOpen ->
+
                         (context as? MainActivity)?.let {
                             it.externalPickerOpen = isOpen
                         }
@@ -109,6 +121,7 @@ fun OwnerAccessScreen(
             }
 
             null -> {
+
                 OwnerDashboard(
                     onSelect = {
                         selectedSection = it
@@ -118,6 +131,7 @@ fun OwnerAccessScreen(
             }
 
             else -> {
+
                 SectionScreen(
                     title = selectedSection ?: "",
                     onBack = {
@@ -197,9 +211,12 @@ fun OwnerAccessScreen(
                     if (configured) {
 
                         if (security.verifyPassword(password)) {
+
                             onUnlock()
                             error = ""
+
                         } else {
+
                             error = if (
                                 security.remainingLockMillis() > 0
                             ) {
@@ -212,6 +229,7 @@ fun OwnerAccessScreen(
                     } else {
 
                         when {
+
                             password.length < 12 ->
                                 error = "رمز باید حداقل ۱۲ کاراکتر باشد."
 
@@ -219,6 +237,7 @@ fun OwnerAccessScreen(
                                 error = "تکرار رمز مطابقت ندارد."
 
                             security.setupPassword(password) -> {
+
                                 configured = true
                                 onUnlock()
                                 error = ""
@@ -233,6 +252,7 @@ fun OwnerAccessScreen(
                     confirmPassword = ""
                 }
             ) {
+
                 Text(
                     if (configured) "ورود امن"
                     else "ثبت رمز مالک"
@@ -240,6 +260,7 @@ fun OwnerAccessScreen(
             }
 
             if (error.isNotEmpty()) {
+
                 Spacer(modifier = Modifier.height(12.dp))
 
                 Text(
@@ -256,6 +277,7 @@ fun OwnerDashboard(
     onSelect: (String) -> Unit,
     onLock: () -> Unit
 ) {
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -286,7 +308,7 @@ fun OwnerDashboard(
 
         DashboardCard(
             "🧠 هوش مصنوعی محلی",
-            "ورود به محیط گفت‌وگو و آماده‌سازی مدل آفلاین",
+            "گفت‌وگو با مدل هوش مصنوعی آفلاین",
             onClick = {
                 onSelect("هوش مصنوعی محلی")
             }
@@ -294,7 +316,7 @@ fun OwnerDashboard(
 
         DashboardCard(
             "🌐 هوش مصنوعی آنلاین",
-            "ورود به محیط گفت‌وگو و آماده‌سازی اتصال آنلاین",
+            "این قابلیت در مراحل بعدی فعال خواهد شد",
             onClick = {
                 onSelect("هوش مصنوعی آنلاین")
             }
@@ -338,15 +360,18 @@ fun DashboardCard(
     description: String,
     onClick: () -> Unit
 ) {
+
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 6.dp),
         onClick = onClick
     ) {
+
         Column(
             modifier = Modifier.padding(18.dp)
         ) {
+
             Text(
                 title,
                 style = MaterialTheme.typography.titleMedium
@@ -367,6 +392,16 @@ fun SectionScreen(
     title: String,
     onBack: () -> Unit
 ) {
+
+    val description = when (title) {
+
+        "هوش مصنوعی آنلاین" ->
+            "اتصال به سرویس‌های هوش مصنوعی آنلاین در مراحل بعدی توسعه فعال خواهد شد."
+
+        else ->
+            "این بخش در مراحل بعدی توسعه فعال خواهد شد."
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -382,9 +417,7 @@ fun SectionScreen(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        Text(
-            "این بخش در مراحل بعدی توسعه فعال خواهد شد."
-        )
+        Text(description)
 
         Spacer(modifier = Modifier.height(24.dp))
 
