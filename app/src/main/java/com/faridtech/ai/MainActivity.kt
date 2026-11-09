@@ -18,6 +18,8 @@ import com.faridtech.ai.security.OwnerSecurity
 
 class MainActivity : ComponentActivity() {
 
+    private var ownerUnlocked by mutableStateOf(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -31,19 +33,30 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 OwnerAccessScreen(
-                    security = security
+                    security = security,
+                    unlocked = ownerUnlocked,
+                    onUnlock = { ownerUnlocked = true },
+                    onLock = { ownerUnlocked = false }
                 )
             }
         }
     }
+
+    override fun onStop() {
+        super.onStop()
+        ownerUnlocked = false
+    }
 }
 
 @Composable
-fun OwnerAccessScreen(security: OwnerSecurity) {
-
+fun OwnerAccessScreen(
+    security: OwnerSecurity,
+    unlocked: Boolean,
+    onUnlock: () -> Unit,
+    onLock: () -> Unit
+) {
     var password by remember { mutableStateOf("") }
     var confirmPassword by remember { mutableStateOf("") }
-    var unlocked by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
     var configured by remember { mutableStateOf(security.isConfigured()) }
 
@@ -54,30 +67,31 @@ fun OwnerAccessScreen(security: OwnerSecurity) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-
         Text(
-            text = "FARID TECH AI",
+            "FARID TECH AI",
             style = MaterialTheme.typography.headlineMedium
         )
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(20.dp))
 
         if (unlocked) {
-
             Text(
-                text = "خوش آمدید",
+                "کنسول مالک",
                 style = MaterialTheme.typography.headlineSmall
             )
 
-            Text("دسترسی مالک تأیید شد.")
+            Spacer(modifier = Modifier.height(12.dp))
 
+            Text("دسترسی مالک تأیید شده است.")
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            Button(onClick = onLock) {
+                Text("قفل برنامه")
+            }
         } else {
-
             Text(
-                text = if (configured)
-                    "ورود مالک"
-                else
-                    "تنظیم رمز مالک",
+                if (configured) "ورود مالک" else "تنظیم رمز مالک",
                 style = MaterialTheme.typography.titleLarge
             )
 
@@ -89,9 +103,7 @@ fun OwnerAccessScreen(security: OwnerSecurity) {
                     password = it
                     error = ""
                 },
-                label = {
-                    Text("رمز شخصی مالک")
-                },
+                label = { Text("رمز شخصی مالک") },
                 visualTransformation = PasswordVisualTransformation(),
                 keyboardOptions = KeyboardOptions(
                     keyboardType = KeyboardType.Password
@@ -100,7 +112,6 @@ fun OwnerAccessScreen(security: OwnerSecurity) {
             )
 
             if (!configured) {
-
                 Spacer(modifier = Modifier.height(12.dp))
 
                 OutlinedTextField(
@@ -109,9 +120,7 @@ fun OwnerAccessScreen(security: OwnerSecurity) {
                         confirmPassword = it
                         error = ""
                     },
-                    label = {
-                        Text("تکرار رمز شخصی")
-                    },
+                    label = { Text("تکرار رمز شخصی") },
                     visualTransformation = PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(
                         keyboardType = KeyboardType.Password
@@ -124,24 +133,18 @@ fun OwnerAccessScreen(security: OwnerSecurity) {
 
             Button(
                 onClick = {
-
                     if (configured) {
-
                         if (security.verifyPassword(password)) {
-                            unlocked = true
+                            onUnlock()
                             error = ""
                         } else {
-                            val remaining = security.remainingLockMillis()
-
-                            error = if (remaining > 0) {
+                            error = if (security.remainingLockMillis() > 0) {
                                 "ورود موقتاً قفل شده است."
                             } else {
                                 "رمز واردشده صحیح نیست."
                             }
                         }
-
                     } else {
-
                         when {
                             password.length < 12 ->
                                 error = "رمز باید حداقل ۱۲ کاراکتر باشد."
@@ -151,7 +154,7 @@ fun OwnerAccessScreen(security: OwnerSecurity) {
 
                             security.setupPassword(password) -> {
                                 configured = true
-                                unlocked = true
+                                onUnlock()
                                 error = ""
                             }
 
@@ -164,14 +167,10 @@ fun OwnerAccessScreen(security: OwnerSecurity) {
                     confirmPassword = ""
                 }
             ) {
-                Text(
-                    if (configured) "ورود امن"
-                    else "ثبت رمز مالک"
-                )
+                Text(if (configured) "ورود امن" else "ثبت رمز مالک")
             }
 
             if (error.isNotEmpty()) {
-
                 Spacer(modifier = Modifier.height(12.dp))
 
                 Text(
