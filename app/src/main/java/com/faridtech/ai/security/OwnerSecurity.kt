@@ -1,13 +1,16 @@
+
 package com.faridtech.ai.security
 
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import android.util.Base64
 import java.security.KeyStore
-import javax.crypto.KeyGenerator
-import javax.crypto.SecretKey
-import javax.crypto.Mac
+import java.security.MessageDigest
 import java.security.SecureRandom
+import javax.crypto.KeyGenerator
+import javax.crypto.Mac
+import javax.crypto.SecretKey
 
 class OwnerSecurity(context: Context) {
 
@@ -42,50 +45,102 @@ class OwnerSecurity(context: Context) {
         return generator.generateKey()
     }
 
-    private fun hashPassword(password: String): String {
+    private fun calculateVerifier(
+        password: String,
+        salt: ByteArray
+    ): ByteArray {
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(getOrCreateKey())
-
-        val result = mac.doFinal(password.toByteArray(Charsets.UTF_8))
-        return result.joinToString("") { "%02x".format(it) }
+        mac.update(salt)
+        return mac.doFinal(password.toByteArray(Charsets.UTF_8))
     }
 
     fun isConfigured(): Boolean {
-        return prefs.contains("owner_hash")
+        return prefs.contains("owner_hash") &&
+            prefs.contains("owner_salt")
     }
 
     fun setupPassword(password: String): Boolean {
-        if (isConfigured()) return false
-        if (password.length < 12) return false
+        if (isConfigured() || password.length < 12) return false
 
-        val hash = hashPassword(password)
+        return try {
+            val salt = ByteArray(16)
+            SecureRandom().nextBytes(salt)
 
-        return prefs.edit()
-            .putString("owner_hash", hash)
-            .putInt("failed_attempts", 0)
-            .commit()
+            val verifier = calculateVerifier(password, salt)
+
+            prefs.edit()
+                .putString(
+                    "owner_salt",
+                    Base64.encodeToString(salt, Base64.NO_WRAP)
+                )
+                .putString(
+                    "owner_hash",
+                    Base64.encodeToString(verifier, Base64.NO_WRAP)
+                )
+                .putInt("failed_attempts", 0)
+                .putLong("lock_until", 0L)
+                .commit()
+        } catch (e: Exception) {
+            false
+        }
     }
 
     fun verifyPassword(password: String): Boolean {
         if (!isConfigured()) return false
 
-        val attempts = prefs.getInt("failed_attempts", 0)
-        if (attempts >= 5) return false
+        val now = System.currentTimeMillis()
+        val lockUntil = prefs.getLong("lock_until", 0L)
 
-        val expected = prefs.getString("owner_hash", null) ?: return false
-        val actual = hashPassword(password)
+        if (now < lockUntil) return false
 
-        val valid = java.security.MessageDigest.isEqual(
-            expected.toByteArray(),
-            actual.toByteArray()
-        )
+        return try {
+            val salt = Base64.decode(
+                prefs.getString("owner_salt", null),
+                Base64.NO_WRAP
+            )
 
-        if (valid) {
-            prefs.edit().putInt("failed_attempts", 0).apply()
-        } else {
-            prefs.edit().putInt("failed_attempts", attempts + 1).apply()
+            val expected = Base64.decode(
+                prefs.getString("owner_hash", null),
+                Base64.NO_WRAP
+            )
+
+            val actual = calculateVerifier(password, salt)
+
+            val valid = MessageDigest.isEqual(expected, actual)
+
+            if (valid) {
+                prefs.edit()
+                    .putInt("failed_attempts", 0)
+                    .putLong("lock_until", 0L)
+                    .apply()
+            } else {
+                val attempts = prefs.getInt("failed_attempts", 0) + 1
+
+                val editor = prefs.edit()
+                    .putInt("failed_attempts", attempts)
+
+                if (attempts >= 5) {
+                    editor.putLong(
+                        "lock_until",
+                        now + 15 * 60 * 1000L
+                    )
+                    editor.putInt("failed_attempts", 0)
+                }
+
+                editor.apply()
+            }
+
+            valid
+        } catch (e: Exception) {
+            false
         }
+    }
 
-        return valid
+    fun remainingLockMillis(): Long {
+        return (
+            prefs.getLong("lock_until", 0L) -
+                System.currentTimeMillis()
+            ).coerceAtLeast(0L)
     }
 }
