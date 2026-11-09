@@ -14,7 +14,15 @@ class LocalAIEngine(private val context: Context) {
             "Qwen2.5-Coder-1.5B-Q4_K_M.gguf"
 
         private const val MIN_MODEL_SIZE = 500_000_000L
+
+        private const val LOAD_SUCCESS =
+            "مدل با موفقیت بارگذاری شد."
     }
+
+    private val native = NativeLlama()
+
+    @Volatile
+    private var loadedModelPath: String? = null
 
     private val modelFile: File
         get() {
@@ -58,8 +66,87 @@ class LocalAIEngine(private val context: Context) {
         }
     }
 
+    suspend fun loadModel(): String {
+        return withContext(Dispatchers.IO) {
+
+            if (!isModelAvailable()) {
+                return@withContext "فایل مدل پیدا نشد یا حجم آن کافی نیست."
+            }
+
+            val path = modelFile.absolutePath
+
+            if (loadedModelPath == path) {
+                return@withContext LOAD_SUCCESS
+            }
+
+            try {
+                native.nativeRelease()
+                loadedModelPath = null
+
+                val result = native.nativeLoadModel(path)
+
+                if (result == LOAD_SUCCESS) {
+                    loadedModelPath = path
+                }
+
+                result
+
+            } catch (e: Exception) {
+                loadedModelPath = null
+                "خطا در بارگذاری مدل: ${e.message ?: "نامشخص"}"
+            }
+        }
+    }
+
+    suspend fun generate(prompt: String): String {
+        return withContext(Dispatchers.IO) {
+
+            if (prompt.isBlank()) {
+                return@withContext "لطفاً پیام خود را وارد کنید."
+            }
+
+            if (!isModelAvailable()) {
+                return@withContext "مدل هوش مصنوعی هنوز نصب نشده است."
+            }
+
+            try {
+                val path = modelFile.absolutePath
+
+                if (loadedModelPath != path) {
+                    native.nativeRelease()
+                    loadedModelPath = null
+
+                    val loadResult =
+                        native.nativeLoadModel(path)
+
+                    if (loadResult != LOAD_SUCCESS) {
+                        return@withContext loadResult
+                    }
+
+                    loadedModelPath = path
+                }
+
+                native.nativeGenerate(prompt, 256)
+
+            } catch (e: Exception) {
+                "خطا در اجرای هوش مصنوعی: ${e.message ?: "نامشخص"}"
+            }
+        }
+    }
+
+    suspend fun releaseModel() {
+        withContext(Dispatchers.IO) {
+            try {
+                native.nativeRelease()
+            } finally {
+                loadedModelPath = null
+            }
+        }
+    }
+
     suspend fun exportModelTo(uri: Uri): Boolean {
         return withContext(Dispatchers.IO) {
+
             if (!isModelAvailable()) {
                 return@withContext false
             }
@@ -69,13 +156,14 @@ class LocalAIEngine(private val context: Context) {
                     .openOutputStream(uri, "w")
                     ?: return@withContext false
 
-                output.use { destination ->
+                val copiedBytes = output.use { destination ->
                     modelFile.inputStream().use { source ->
                         source.copyTo(destination)
                     }
                 }
 
-                true
+                copiedBytes == modelFile.length()
+
             } catch (_: Exception) {
                 false
             }
@@ -84,6 +172,7 @@ class LocalAIEngine(private val context: Context) {
 
     suspend fun importModelFrom(uri: Uri): Boolean {
         return withContext(Dispatchers.IO) {
+
             val parent = modelFile.parentFile
                 ?: return@withContext false
 
@@ -91,8 +180,11 @@ class LocalAIEngine(private val context: Context) {
                 return@withContext false
             }
 
-            val temporaryFile = File(parent, "$MODEL_NAME.importing")
-            val backupFile = File(parent, "$MODEL_NAME.previous")
+            val temporaryFile =
+                File(parent, "$MODEL_NAME.importing")
+
+            val backupFile =
+                File(parent, "$MODEL_NAME.previous")
 
             try {
                 val input = context.contentResolver
@@ -113,17 +205,23 @@ class LocalAIEngine(private val context: Context) {
                 }
 
                 if (backupFile.exists()) {
-                    backupFile.delete()
+                    temporaryFile.delete()
+                    return@withContext false
                 }
+
+                releaseModel()
 
                 val hadOldModel = modelFile.exists()
 
-                if (hadOldModel && !modelFile.renameTo(backupFile)) {
+                if (hadOldModel &&
+                    !modelFile.renameTo(backupFile)
+                ) {
                     temporaryFile.delete()
                     return@withContext false
                 }
 
                 if (!temporaryFile.renameTo(modelFile)) {
+
                     if (hadOldModel) {
                         backupFile.renameTo(modelFile)
                     }
@@ -132,10 +230,14 @@ class LocalAIEngine(private val context: Context) {
                     return@withContext false
                 }
 
-                backupFile.delete()
+                if (backupFile.exists()) {
+                    backupFile.delete()
+                }
+
                 true
 
             } catch (_: Exception) {
+
                 temporaryFile.delete()
 
                 if (backupFile.exists() && !modelFile.exists()) {
@@ -143,21 +245,6 @@ class LocalAIEngine(private val context: Context) {
                 }
 
                 false
-            }
-        }
-    }
-
-    suspend fun generate(prompt: String): String {
-        return withContext(Dispatchers.IO) {
-            when {
-                prompt.isBlank() ->
-                    "لطفاً پیام خود را وارد کنید."
-
-                !isModelAvailable() ->
-                    "مدل هوش مصنوعی هنوز نصب نشده است."
-
-                else ->
-                    "فایل مدل شناسایی شد؛ موتور اجرای هوش مصنوعی هنوز متصل نشده است."
             }
         }
     }
