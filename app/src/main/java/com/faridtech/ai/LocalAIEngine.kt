@@ -152,7 +152,9 @@ class LocalAIEngine(context: Context) {
     private fun loadModelLocked(): String {
 
         if (!isModelAvailable()) {
-            ModelStorageCoordinator.loadedModelPath = null
+
+            // وضعیت Native و Kotlin هر دو پاک می‌شوند.
+            ModelStorageCoordinator.releaseLoadedModelLocked()
 
             return "فایل مدل معتبر نیست یا حجم آن کافی نیست."
         }
@@ -167,7 +169,6 @@ class LocalAIEngine(context: Context) {
 
         return try {
 
-            // Release any previously loaded native model first.
             ModelStorageCoordinator.releaseLoadedModelLocked()
 
             val result = native.nativeLoadModel(path)
@@ -205,7 +206,8 @@ class LocalAIEngine(context: Context) {
             engineMutex.withLock {
 
                 if (!isModelAvailable()) {
-                    ModelStorageCoordinator.loadedModelPath = null
+
+                    ModelStorageCoordinator.releaseLoadedModelLocked()
 
                     return@withLock "فایل مدل معتبر نیست یا نصب نشده است."
                 }
