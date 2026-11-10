@@ -3,9 +3,11 @@ package com.faridtech.ai
 
 import android.content.Context
 import android.util.AtomicFile
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
@@ -35,6 +37,7 @@ internal data class RecoveryJournalEntry(
 )
 
 internal sealed class RecoveryCheckResult {
+
     data class Resolved(
         val operationId: String,
         val message: String
@@ -60,7 +63,11 @@ internal class ProjectRecoveryJournal(context: Context) {
 
         private const val JOURNAL_DIRECTORY = "project_recovery"
 
-        private val HASH_REGEX = Regex("^[a-fA-F0-9]{64}$")
+        private val HASH_REGEX =
+            Regex("^[a-fA-F0-9]{64}$")
+
+        private val ID_REGEX =
+            Regex("^[a-fA-F0-9-]{36}$")
     }
 
     private val appContext = context.applicationContext
@@ -69,17 +76,19 @@ internal class ProjectRecoveryJournal(context: Context) {
         File(appContext.filesDir, JOURNAL_DIRECTORY)
 
     private fun journalFile(id: String): File? {
-        if (id.isBlank() || !id.matches(Regex("^[a-fA-F0-9-]{36}$"))) {
+        if (!ID_REGEX.matches(id)) {
             return null
         }
 
-        val file = File(journalDirectory, "$id.json")
-
         return try {
             val root = journalDirectory.canonicalFile
-            val target = file.canonicalFile
+            val target = File(root, "$id.json").canonicalFile
 
-            if (target.parentFile == root) target else null
+            if (target.parentFile == root) {
+                target
+            } else {
+                null
+            }
         } catch (_: Exception) {
             null
         }
@@ -89,9 +98,25 @@ internal class ProjectRecoveryJournal(context: Context) {
         return HASH_REGEX.matches(hash)
     }
 
-    private fun isValidEntry(entry: RecoveryJournalEntry): Boolean {
-        if (entry.id.isBlank()) return false
-        if (!entry.id.matches(Regex("^[a-fA-F0-9-]{36}$"))) return false
+    private fun isInsideDirectory(
+        file: File,
+        directory: File
+    ): Boolean {
+        val rootPath = directory.canonicalPath
+            .trimEnd(File.separatorChar)
+
+        val filePath = file.canonicalPath
+
+        return filePath.startsWith(
+            rootPath + File.separator
+        )
+    }
+
+    private fun isValidEntry(
+        entry: RecoveryJournalEntry
+    ): Boolean {
+
+        if (!ID_REGEX.matches(entry.id)) return false
 
         if (entry.projectPath.isBlank()) return false
         if (entry.filePath.isBlank()) return false
@@ -105,7 +130,10 @@ internal class ProjectRecoveryJournal(context: Context) {
         return true
     }
 
-    private fun serialize(entry: RecoveryJournalEntry): ByteArray {
+    private fun serialize(
+        entry: RecoveryJournalEntry
+    ): ByteArray {
+
         val json = JSONObject().apply {
             put("version", JOURNAL_VERSION)
             put("id", entry.id)
@@ -122,31 +150,40 @@ internal class ProjectRecoveryJournal(context: Context) {
         return json.toString().toByteArray(Charsets.UTF_8)
     }
 
-    private fun deserialize(bytes: ByteArray): RecoveryJournalEntry? {
+    private fun deserialize(
+        bytes: ByteArray
+    ): RecoveryJournalEntry {
+
         if (bytes.isEmpty() || bytes.size > MAX_JOURNAL_SIZE) {
-            return null
+            throw IOException("اندازه گزارش بازیابی معتبر نیست.")
         }
 
-        return try {
-            val json = JSONObject(bytes.toString(Charsets.UTF_8))
+        try {
+            val json = JSONObject(
+                bytes.toString(Charsets.UTF_8)
+            )
 
             if (json.optInt("version", -1) != JOURNAL_VERSION) {
-                return null
+                throw IOException("نسخه گزارش بازیابی پشتیبانی نمی‌شود.")
             }
 
-            val operationType = runCatching {
+            val operationType = try {
                 RecoveryOperationType.valueOf(
                     json.getString("operationType")
                 )
-            }.getOrNull() ?: return null
+            } catch (_: Exception) {
+                throw IOException("نوع عملیات بازیابی معتبر نیست.")
+            }
 
-            val state = runCatching {
+            val state = try {
                 RecoveryOperationState.valueOf(
                     json.getString("state")
                 )
-            }.getOrNull() ?: return null
+            } catch (_: Exception) {
+                throw IOException("وضعیت عملیات بازیابی معتبر نیست.")
+            }
 
-            RecoveryJournalEntry(
+            val entry = RecoveryJournalEntry(
                 id = json.getString("id"),
                 projectPath = json.getString("projectPath"),
                 filePath = json.getString("filePath"),
@@ -156,48 +193,72 @@ internal class ProjectRecoveryJournal(context: Context) {
                 operationType = operationType,
                 state = state,
                 createdAt = json.getLong("createdAt")
-            ).takeIf(::isValidEntry)
-        } catch (_: Exception) {
-            null
+            )
+
+            if (!isValidEntry(entry)) {
+                throw IOException("اطلاعات گزارش بازیابی معتبر نیست.")
+            }
+
+            return entry
+
+        } catch (exception: IOException) {
+            throw exception
+        } catch (exception: Exception) {
+            throw IOException(
+                "خواندن اطلاعات گزارش بازیابی ناموفق بود.",
+                exception
+            )
         }
     }
 
-    private fun readEntry(file: File): RecoveryJournalEntry? {
-        return try {
-            if (!file.exists() || !file.isFile) return null
-            if (file.length() > MAX_JOURNAL_SIZE) return null
+    private fun readEntry(file: File): RecoveryJournalEntry {
 
-            val atomicFile = AtomicFile(file)
-            val bytes = atomicFile.openRead().use { input ->
-                val output = java.io.ByteArrayOutputStream()
-                val buffer = ByteArray(1024)
-                var total = 0
+        if (!file.exists() || !file.isFile) {
+            throw IOException("فایل گزارش بازیابی پیدا نشد.")
+        }
 
-                while (true) {
-                    val count = input.read(buffer)
-                    if (count == -1) break
+        val canonicalDirectory = journalDirectory.canonicalFile
 
-                    total += count
-                    if (total > MAX_JOURNAL_SIZE) {
-                        return null
-                    }
+        if (!isInsideDirectory(file, canonicalDirectory)) {
+            throw IOException("مسیر گزارش بازیابی خارج از پوشه مجاز است.")
+        }
 
-                    output.write(buffer, 0, count)
+        val atomicFile = AtomicFile(file)
+
+        val bytes = atomicFile.openRead().use { input ->
+
+            val output = ByteArrayOutputStream()
+            val buffer = ByteArray(1024)
+
+            var total = 0
+
+            while (true) {
+                val count = input.read(buffer)
+
+                if (count == -1) break
+
+                total += count
+
+                if (total > MAX_JOURNAL_SIZE) {
+                    throw IOException(
+                        "حجم گزارش بازیابی از حد مجاز بیشتر است."
+                    )
                 }
 
-                output.toByteArray()
+                output.write(buffer, 0, count)
             }
 
-            deserialize(bytes)
-        } catch (_: Exception) {
-            null
+            output.toByteArray()
         }
+
+        return deserialize(bytes)
     }
 
     private fun writeEntry(
         file: File,
         entry: RecoveryJournalEntry
     ): Boolean {
+
         if (!isValidEntry(entry)) return false
 
         return try {
@@ -207,8 +268,17 @@ internal class ProjectRecoveryJournal(context: Context) {
                 return false
             }
 
+            val canonicalDirectory = journalDirectory.canonicalFile
+
+            if (!isInsideDirectory(file, canonicalDirectory)) {
+                return false
+            }
+
             val bytes = serialize(entry)
-            if (bytes.size > MAX_JOURNAL_SIZE) return false
+
+            if (bytes.size > MAX_JOURNAL_SIZE) {
+                return false
+            }
 
             val atomicFile = AtomicFile(file)
             val output = atomicFile.startWrite()
@@ -218,48 +288,65 @@ internal class ProjectRecoveryJournal(context: Context) {
                 atomicFile.finishWrite(output)
                 true
             } catch (exception: Exception) {
-                atomicFile.failWrite(output)
+                try {
+                    atomicFile.failWrite(output)
+                } catch (_: Exception) {
+                    // خطای اصلی حفظ می‌شود.
+                }
+
                 false
             }
+
         } catch (_: Exception) {
             false
         }
     }
 
-    private suspend fun calculateSha256(file: File): String? =
-        withContext(Dispatchers.IO) {
-            try {
-                if (!file.exists() || !file.isFile) return@withContext null
-                if (file.length() > MAX_TARGET_FILE_SIZE) {
-                    return@withContext null
-                }
+    private suspend fun calculateSha256(
+        file: File
+    ): String? = withContext(Dispatchers.IO) {
 
-                val digest = MessageDigest.getInstance("SHA-256")
-
-                file.inputStream().use { input ->
-                    val buffer = ByteArray(8192)
-                    var total = 0L
-
-                    while (true) {
-                        val count = input.read(buffer)
-                        if (count == -1) break
-
-                        total += count
-                        if (total > MAX_TARGET_FILE_SIZE) {
-                            return@withContext null
-                        }
-
-                        digest.update(buffer, 0, count)
-                    }
-                }
-
-                digest.digest().joinToString("") {
-                    "%02x".format(it)
-                }
-            } catch (_: Exception) {
-                null
+        try {
+            if (!file.exists() || !file.isFile) {
+                return@withContext null
             }
+
+            if (file.length() > MAX_TARGET_FILE_SIZE) {
+                return@withContext null
+            }
+
+            val digest = MessageDigest.getInstance("SHA-256")
+
+            file.inputStream().use { input ->
+
+                val buffer = ByteArray(8192)
+                var total = 0L
+
+                while (true) {
+                    val count = input.read(buffer)
+
+                    if (count == -1) break
+
+                    total += count
+
+                    if (total > MAX_TARGET_FILE_SIZE) {
+                        return@withContext null
+                    }
+
+                    digest.update(buffer, 0, count)
+                }
+            }
+
+            digest.digest().joinToString("") {
+                "%02x".format(it)
+            }
+
+        } catch (exception: CancellationException) {
+            throw exception
+        } catch (_: Exception) {
+            null
         }
+    }
 
     suspend fun create(
         projectPath: String,
@@ -270,20 +357,39 @@ internal class ProjectRecoveryJournal(context: Context) {
         operationType: RecoveryOperationType
     ): RecoveryJournalEntry? = withContext(Dispatchers.IO) {
 
-        if (projectPath.isBlank() ||
-            filePath.isBlank() ||
-            backupPath.isBlank()
-        ) {
-            return@withContext null
-        }
-
-        if (!isValidHash(beforeHash) || !isValidHash(targetHash)) {
-            return@withContext null
-        }
-
         try {
+            if (projectPath.isBlank() ||
+                filePath.isBlank() ||
+                backupPath.isBlank()
+            ) {
+                return@withContext null
+            }
+
+            if (!isValidHash(beforeHash) ||
+                !isValidHash(targetHash)
+            ) {
+                return@withContext null
+            }
+
             if (!journalDirectory.exists() &&
                 !journalDirectory.mkdirs()
+            ) {
+                return@withContext null
+            }
+
+            val canonicalProject =
+                File(projectPath).canonicalFile
+
+            val canonicalTarget =
+                File(filePath).canonicalFile
+
+            val canonicalBackup =
+                File(backupPath).canonicalFile
+
+            if (!isInsideDirectory(
+                    canonicalTarget,
+                    canonicalProject
+                )
             ) {
                 return@withContext null
             }
@@ -292,9 +398,9 @@ internal class ProjectRecoveryJournal(context: Context) {
 
             val entry = RecoveryJournalEntry(
                 id = id,
-                projectPath = File(projectPath).canonicalPath,
-                filePath = File(filePath).canonicalPath,
-                backupPath = File(backupPath).canonicalPath,
+                projectPath = canonicalProject.path,
+                filePath = canonicalTarget.path,
+                backupPath = canonicalBackup.path,
                 beforeHash = beforeHash.lowercase(),
                 targetHash = targetHash.lowercase(),
                 operationType = operationType,
@@ -310,76 +416,132 @@ internal class ProjectRecoveryJournal(context: Context) {
             }
 
             entry
+
+        } catch (exception: CancellationException) {
+            throw exception
         } catch (_: Exception) {
             null
         }
     }
 
-    suspend fun markCommitted(operationId: String): Boolean =
-        withContext(Dispatchers.IO) {
+    suspend fun markCommitted(
+        operationId: String
+    ): Boolean = withContext(Dispatchers.IO) {
 
+        try {
             val file = journalFile(operationId)
                 ?: return@withContext false
 
             val entry = readEntry(file)
-                ?: return@withContext false
+
+            if (entry.id != operationId) {
+                return@withContext false
+            }
+
+            if (entry.state == RecoveryOperationState.COMMITTED) {
+                return@withContext true
+            }
 
             val updated = entry.copy(
                 state = RecoveryOperationState.COMMITTED
             )
 
             writeEntry(file, updated)
+
+        } catch (exception: CancellationException) {
+            throw exception
+        } catch (_: Exception) {
+            false
         }
+    }
 
-    suspend fun remove(operationId: String): Boolean =
-        withContext(Dispatchers.IO) {
+    suspend fun remove(
+        operationId: String
+    ): Boolean = withContext(Dispatchers.IO) {
 
+        try {
             val file = journalFile(operationId)
                 ?: return@withContext false
 
-            if (!file.exists()) {
-                return@withContext true
-            }
+            AtomicFile(file).delete()
 
-            try {
-                AtomicFile(file).delete()
-                !file.exists()
-            } catch (_: Exception) {
-                false
-            }
+            !file.exists() &&
+                !File(file.path + ".bak").exists() &&
+                !File(file.path + ".new").exists()
+
+        } catch (exception: CancellationException) {
+            throw exception
+        } catch (_: Exception) {
+            false
         }
+    }
 
     suspend fun getPendingEntries(
         projectPath: String
     ): List<RecoveryJournalEntry> = withContext(Dispatchers.IO) {
 
         if (projectPath.isBlank()) {
-            return@withContext emptyList()
+            throw ProjectRecoveryException(
+                listOf("مسیر پروژه برای بررسی گزارش‌های بازیابی خالی است.")
+            )
         }
 
         val canonicalProject = try {
             File(projectPath).canonicalPath
-        } catch (_: Exception) {
+        } catch (exception: Exception) {
+            throw ProjectRecoveryException(
+                listOf("مسیر پروژه برای بررسی گزارش‌های بازیابی معتبر نیست.")
+            )
+        }
+
+        if (!journalDirectory.exists()) {
             return@withContext emptyList()
         }
 
-        if (!journalDirectory.exists() ||
-            !journalDirectory.isDirectory
-        ) {
-            return@withContext emptyList()
+        if (!journalDirectory.isDirectory) {
+            throw ProjectRecoveryException(
+                listOf("مسیر گزارش‌های بازیابی یک پوشه معتبر نیست.")
+            )
         }
 
-        journalDirectory.listFiles()
-            ?.asSequence()
-            ?.filter {
-                it.isFile &&
-                    it.extension.equals("json", ignoreCase = true)
+        val files = journalDirectory.listFiles()
+            ?: throw ProjectRecoveryException(
+                listOf("خواندن فهرست گزارش‌های بازیابی امکان‌پذیر نیست.")
+            )
+
+        val entries = mutableListOf<RecoveryJournalEntry>()
+        val errors = mutableListOf<String>()
+
+        for (file in files) {
+
+            if (!file.isFile ||
+                !file.extension.equals("json", ignoreCase = true)
+            ) {
+                continue
             }
-            ?.mapNotNull(::readEntry)
-            ?.filter { it.projectPath == canonicalProject }
-            ?.sortedBy { it.createdAt }
-            ?.toList()
-            ?: emptyList()
+
+            try {
+                val entry = readEntry(file)
+
+                if (entry.projectPath == canonicalProject) {
+                    entries.add(entry)
+                }
+
+            } catch (exception: CancellationException) {
+                throw exception
+            } catch (exception: Exception) {
+                errors.add(
+                    "گزارش ${file.name} قابل خواندن نیست: " +
+                        (exception.message ?: "خطای نامشخص")
+                )
+            }
+        }
+
+        if (errors.isNotEmpty()) {
+            throw ProjectRecoveryException(errors)
+        }
+
+        entries.sortedBy { it.createdAt }
     }
 
     suspend fun inspectOperation(
@@ -390,6 +552,15 @@ internal class ProjectRecoveryJournal(context: Context) {
             return@withContext RecoveryCheckResult.Invalid(
                 entry.id,
                 "اطلاعات عملیات بازیابی معتبر نیست."
+            )
+        }
+
+        val project = try {
+            File(entry.projectPath).canonicalFile
+        } catch (_: Exception) {
+            return@withContext RecoveryCheckResult.Invalid(
+                entry.id,
+                "مسیر پروژه معتبر نیست."
             )
         }
 
@@ -408,6 +579,13 @@ internal class ProjectRecoveryJournal(context: Context) {
             return@withContext RecoveryCheckResult.Invalid(
                 entry.id,
                 "مسیر نسخه پشتیبان معتبر نیست."
+            )
+        }
+
+        if (!isInsideDirectory(target, project)) {
+            return@withContext RecoveryCheckResult.Invalid(
+                entry.id,
+                "فایل اصلی خارج از پوشه پروژه قرار دارد."
             )
         }
 
@@ -432,27 +610,74 @@ internal class ProjectRecoveryJournal(context: Context) {
             )
         }
 
+        val backupHash = calculateSha256(backup)
+            ?: return@withContext RecoveryCheckResult.Pending(
+                entry.id,
+                "هش نسخه پشتیبان قابل محاسبه نیست."
+            )
+
+        if (!backupHash.equals(entry.beforeHash, ignoreCase = true)) {
+            return@withContext RecoveryCheckResult.Pending(
+                entry.id,
+                "محتوای نسخه پشتیبان با هش محتوای اولیه مطابقت ندارد."
+            )
+        }
+
         val currentHash = calculateSha256(target)
             ?: return@withContext RecoveryCheckResult.Pending(
                 entry.id,
                 "هش فایل فعلی قابل محاسبه نیست."
             )
 
-        when (currentHash) {
-            entry.targetHash -> RecoveryCheckResult.Resolved(
-                entry.id,
-                "محتوای جدید با موفقیت ثبت شده است."
-            )
+        val matchesBefore = currentHash.equals(
+            entry.beforeHash,
+            ignoreCase = true
+        )
 
-            entry.beforeHash -> RecoveryCheckResult.Resolved(
-                entry.id,
-                "محتوای قبلی فایل حفظ شده است."
-            )
+        val matchesTarget = currentHash.equals(
+            entry.targetHash,
+            ignoreCase = true
+        )
 
-            else -> RecoveryCheckResult.Pending(
-                entry.id,
-                "محتوای فایل با وضعیت ثبت‌شده مطابقت ندارد؛ بازیابی خودکار انجام نشد."
-            )
+        when (entry.state) {
+
+            RecoveryOperationState.PREPARED -> {
+                when {
+                    matchesTarget -> RecoveryCheckResult.Resolved(
+                        entry.id,
+                        "محتوای جدید نوشته شده است؛ ثبت نهایی گزارش هنوز کامل نشده بود."
+                    )
+
+                    matchesBefore -> RecoveryCheckResult.Resolved(
+                        entry.id,
+                        "محتوای قبلی فایل حفظ شده است؛ تغییری اعمال نشده بود."
+                    )
+
+                    else -> RecoveryCheckResult.Pending(
+                        entry.id,
+                        "محتوای فایل با وضعیت ثبت‌شده مطابقت ندارد؛ بازیابی خودکار انجام نشد."
+                    )
+                }
+            }
+
+            RecoveryOperationState.COMMITTED -> {
+                when {
+                    matchesTarget -> RecoveryCheckResult.Resolved(
+                        entry.id,
+                        "عملیات ثبت نهایی شده و محتوای فایل با نسخه مقصد مطابقت دارد."
+                    )
+
+                    matchesBefore -> RecoveryCheckResult.Pending(
+                        entry.id,
+                        "گزارش عملیات ثبت نهایی شده است اما فایل هنوز محتوای قبلی را دارد."
+                    )
+
+                    else -> RecoveryCheckResult.Pending(
+                        entry.id,
+                        "محتوای فایل با عملیات ثبت نهایی‌شده مطابقت ندارد؛ بررسی دستی لازم است."
+                    )
+                }
+            }
         }
     }
 
