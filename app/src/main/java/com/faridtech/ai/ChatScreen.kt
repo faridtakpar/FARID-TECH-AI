@@ -15,12 +15,17 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 private data class ChatMessage(
     val text: String,
     val isUser: Boolean
 )
+
+private const val MAX_HISTORY_MESSAGES = 100
+private const val MAX_USER_MESSAGE_CHARS = 1200
+private const val MAX_PROMPT_CHARS = 1800
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -58,7 +63,9 @@ fun ChatScreen(
                 .forEach { line ->
 
                     try {
-                        val parts = line.split(":", limit = 2)
+
+                        val parts =
+                            line.split(":", limit = 2)
 
                         if (parts.size == 2) {
 
@@ -79,11 +86,11 @@ fun ChatScreen(
                         }
 
                     } catch (_: Exception) {
+                        // Ignore corrupted history entries.
                     }
                 }
 
-            // Keep only the latest 100 messages.
-            while (size > 100) {
+            while (size > MAX_HISTORY_MESSAGES) {
                 removeAt(0)
             }
         }
@@ -123,10 +130,10 @@ fun ChatScreen(
 
     val listState = rememberLazyListState()
 
-    // Save chat history with a maximum of 100 messages.
+    // Save chat history.
     fun saveHistory() {
 
-        while (messages.size > 100) {
+        while (messages.size > MAX_HISTORY_MESSAGES) {
             messages.removeAt(0)
         }
 
@@ -145,7 +152,7 @@ fun ChatScreen(
             .apply()
     }
 
-    // Build a recent conversation prompt.
+    // Build a prompt using recent conversation messages.
     fun buildConversationPrompt(): String {
 
         val systemMessage =
@@ -155,11 +162,10 @@ fun ChatScreen(
             "در صورت نیاز از اطلاعات پیام‌های قبلی استفاده کن.\n" +
             "<|im_end|>\n"
 
-        val selectedMessages = mutableListOf<String>()
+        val selectedMessages =
+            mutableListOf<String>()
 
         var usedCharacters = systemMessage.length
-
-        val maxCharacters = 2800
 
         for (message in messages.asReversed()) {
 
@@ -175,7 +181,8 @@ fun ChatScreen(
                 "\n<|im_end|>\n"
 
             if (
-                usedCharacters + block.length > maxCharacters
+                usedCharacters + block.length >
+                MAX_PROMPT_CHARS
             ) {
                 break
             }
@@ -197,7 +204,7 @@ fun ChatScreen(
         }
     }
 
-    // Recognize native and Kotlin engine errors.
+    // Detect native and Kotlin engine errors.
     fun isEngineError(response: String): Boolean {
 
         val normalized = response.trim()
@@ -211,6 +218,7 @@ fun ChatScreen(
             "فایل مدل معتبر نیست یا نصب نشده است",
             "ابتدا باید مدل را بارگذاری کنی",
             "بارگذاری مدل ناموفق",
+            "خطا در بارگذاری مدل",
             "ساخت محیط اجرای مدل ناموفق",
             "طول پیام برای تبدیل",
             "پیام برای ظرفیت فعلی مدل",
@@ -234,6 +242,7 @@ fun ChatScreen(
         }
     }
 
+    // Backup model launcher.
     val backupLauncher =
         rememberLauncherForActivityResult(
             contract = ActivityResultContracts.CreateDocument(
@@ -248,6 +257,7 @@ fun ChatScreen(
                 scope.launch {
 
                     transferring = true
+
                     downloadStatus =
                         "در حال ساخت نسخه پشتیبان..."
 
@@ -268,6 +278,7 @@ fun ChatScreen(
             }
         }
 
+    // Restore model launcher.
     val restoreLauncher =
         rememberLauncherForActivityResult(
             contract = ActivityResultContracts.OpenDocument()
@@ -280,6 +291,7 @@ fun ChatScreen(
                 scope.launch {
 
                     transferring = true
+
                     downloadStatus =
                         "در حال بازیابی مدل..."
 
@@ -304,6 +316,7 @@ fun ChatScreen(
             }
         }
 
+    // Initial checks.
     LaunchedEffect(Unit) {
 
         modelReady = engine.checkModel()
@@ -336,6 +349,7 @@ fun ChatScreen(
         }
     }
 
+    // Download model.
     fun startDownload() {
 
         if (
@@ -355,15 +369,19 @@ fun ChatScreen(
 
             try {
 
-                downloader.download {
-                    downloaded, total ->
+                downloader.download { downloaded, total ->
 
                     if (total > 0) {
 
-                        downloadProgress =
+                        val progress =
                             ((downloaded * 100) / total)
                                 .toInt()
                                 .coerceIn(0, 100)
+
+                        // Update Compose state on the main thread.
+                        scope.launch(Dispatchers.Main.immediate) {
+                            downloadProgress = progress
+                        }
                     }
                 }
 
@@ -391,6 +409,7 @@ fun ChatScreen(
         }
     }
 
+    // Send message to local AI.
     fun sendMessage() {
 
         val userPrompt = input.trim()
@@ -401,6 +420,14 @@ fun ChatScreen(
             downloading ||
             transferring
         ) {
+            return
+        }
+
+        if (userPrompt.length > MAX_USER_MESSAGE_CHARS) {
+
+            nativeStatus =
+                "پیام بیش از حد طولانی است. لطفاً آن را کوتاه‌تر کنید."
+
             return
         }
 
@@ -568,6 +595,7 @@ fun ChatScreen(
                 modifier = Modifier.height(8.dp)
             )
 
+            // Native engine status.
             Card(
                 modifier = Modifier.fillMaxWidth()
             ) {
@@ -604,6 +632,7 @@ fun ChatScreen(
                 modifier = Modifier.height(8.dp)
             )
 
+            // Offline model controls.
             Card(
                 modifier = Modifier.fillMaxWidth()
             ) {
@@ -672,11 +701,15 @@ fun ChatScreen(
                             onExternalPickerStateChanged(true)
 
                             try {
+
                                 backupLauncher.launch(
                                     "FARID-TECH-Qwen2.5-Coder-1.5B.gguf"
                                 )
-                            } catch (e: Exception) {
+
+                            } catch (_: Exception) {
+
                                 onExternalPickerStateChanged(false)
+
                                 downloadStatus =
                                     "بازکردن محل ذخیره ناموفق بود."
                             }
@@ -700,11 +733,15 @@ fun ChatScreen(
                             onExternalPickerStateChanged(true)
 
                             try {
+
                                 restoreLauncher.launch(
                                     arrayOf("*/*")
                                 )
-                            } catch (e: Exception) {
+
+                            } catch (_: Exception) {
+
                                 onExternalPickerStateChanged(false)
+
                                 downloadStatus =
                                     "بازکردن انتخاب‌گر فایل ناموفق بود."
                             }
@@ -733,6 +770,7 @@ fun ChatScreen(
                 modifier = Modifier.height(12.dp)
             )
 
+            // Chat messages.
             LazyColumn(
 
                 modifier = Modifier.weight(1f),
@@ -772,6 +810,7 @@ fun ChatScreen(
         }
     }
 
+    // Automatically scroll to the latest message.
     LaunchedEffect(messages.size) {
 
         if (messages.isNotEmpty()) {
