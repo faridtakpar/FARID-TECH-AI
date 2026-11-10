@@ -726,7 +726,335 @@ class ProjectFileChangeManager(context: Context) {
         }
 
     // -------------------------------------------------
-    // بازگردانی امن نسخه پشتیبان
+    // بازگردانی نسخه تاریخی با پشتیبان‌گیری از وضعیت فعلی
+    // -------------------------------------------------
+
+    suspend fun restoreHistoricalBackup(
+        project: File,
+        file: File,
+        backupPath: String,
+        ownerConfirmed: Boolean
+    ): ProjectFileRestoreResult =
+        withContext(Dispatchers.IO) {
+
+            if (!ownerConfirmed) {
+                return@withContext ProjectFileRestoreResult.Rejected(
+                    "بازگردانی بدون تأیید مالک مجاز نیست."
+                )
+            }
+
+            synchronized(lock) {
+
+                try {
+
+                    val projectRoot = validateProject(project)
+                        ?: return@synchronized ProjectFileRestoreResult.Rejected(
+                            "مسیر پروژه معتبر نیست."
+                        )
+
+                    val target = validateFile(
+                        projectRoot,
+                        file
+                    ) ?: return@synchronized ProjectFileRestoreResult.Rejected(
+                        "فایل مقصد معتبر یا قابل نوشتن نیست."
+                    )
+
+                    val backupRoot = File(
+                        appContext.filesDir,
+                        BACKUP_DIRECTORY
+                    ).canonicalFile
+
+                    if (!backupRoot.isDirectory) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "پوشه نسخه‌های پشتیبان پیدا نشد."
+                        )
+                    }
+
+                    // اعتبارسنجی نسخه تاریخی انتخاب‌شده
+
+                    val historicalBackup =
+                        File(backupPath).canonicalFile
+
+                    val backupPrefix =
+                        backupRoot.path + File.separator
+
+                    if (
+                        !historicalBackup.path.startsWith(backupPrefix) ||
+                        !historicalBackup.isFile ||
+                        !historicalBackup.canRead() ||
+                        historicalBackup.length() <= 0L ||
+                        historicalBackup.length() > MAX_FILE_SIZE
+                    ) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "مسیر یا اندازه نسخه تاریخی معتبر نیست."
+                        )
+                    }
+
+                    val historicalId =
+                        historicalBackup.nameWithoutExtension
+
+                    val parsedId = try {
+                        UUID.fromString(historicalId)
+                    } catch (_: Exception) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "شناسه نسخه تاریخی معتبر نیست."
+                        )
+                    }
+
+                    if (parsedId.toString() != historicalId) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "شناسه نسخه تاریخی معتبر نیست."
+                        )
+                    }
+
+                    val historicalManifest = File(
+                        backupRoot,
+                        "$historicalId.json"
+                    ).canonicalFile
+
+                    if (
+                        !historicalManifest.path.startsWith(backupPrefix) ||
+                        !historicalManifest.isFile ||
+                        !historicalManifest.canRead() ||
+                        historicalManifest.length() > MAX_MANIFEST_SIZE
+                    ) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "اطلاعات نسخه تاریخی پیدا نشد یا معتبر نیست."
+                        )
+                    }
+
+                    val manifest = JSONObject(
+                        historicalManifest.readText(Charsets.UTF_8)
+                    )
+
+                    val savedProjectPath =
+                        manifest.optString("projectPath")
+
+                    val savedFilePath =
+                        manifest.optString("filePath")
+
+                    val originalHash =
+                        manifest.optString("originalHash")
+
+                    val appliedHash =
+                        manifest.optString("appliedHash")
+
+                    val savedBackupId =
+                        manifest.optString("backupId")
+
+                    val createdAt =
+                        manifest.optLong("createdAt", 0L)
+
+                    if (
+                        savedProjectPath != projectRoot.path ||
+                        savedFilePath != target.path ||
+                        savedBackupId != historicalId ||
+                        createdAt <= 0L ||
+                        !isSafeHistoricalPath(
+                            projectRoot,
+                            savedFilePath
+                        ) ||
+                        !isValidHash(originalHash) ||
+                        !isValidHash(appliedHash)
+                    ) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "این نسخه پشتیبان متعلق به این پروژه یا فایل نیست."
+                        )
+                    }
+
+                    // خواندن و بررسی محتوای نسخه تاریخی
+
+                    val historicalBytes =
+                        historicalBackup.readBytes()
+
+                    if (
+                        historicalBytes.isEmpty() ||
+                        historicalBytes.size > MAX_FILE_SIZE ||
+                        calculateHash(historicalBytes) != originalHash
+                    ) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "نسخه تاریخی خالی، آسیب‌دیده یا دستکاری شده است."
+                        )
+                    }
+
+                    // خواندن وضعیت فعلی فایل
+
+                    val currentBytes = target.readBytes()
+
+                    if (
+                        currentBytes.isEmpty() ||
+                        currentBytes.size > MAX_FILE_SIZE
+                    ) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "محتوای فایل فعلی خالی یا بیش از حد مجاز است."
+                        )
+                    }
+
+                    val currentHash =
+                        calculateHash(currentBytes)
+
+                    if (currentHash == originalHash) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "فایل در حال حاضر دقیقاً همین نسخه را دارد."
+                        )
+                    }
+
+                    // ایجاد نسخه پشتیبان از وضعیت فعلی
+
+                    val newBackupId =
+                        UUID.randomUUID().toString()
+
+                    val safetyBackup = File(
+                        backupRoot,
+                        "$newBackupId.bak"
+                    ).canonicalFile
+
+                    val safetyManifest = File(
+                        backupRoot,
+                        "$newBackupId.json"
+                    ).canonicalFile
+
+                    if (
+                        !safetyBackup.path.startsWith(backupPrefix) ||
+                        !safetyManifest.path.startsWith(backupPrefix)
+                    ) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "مسیر پشتیبان وضعیت فعلی معتبر نیست."
+                        )
+                    }
+
+                    if (!writeBackup(safetyBackup, currentBytes)) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "تهیه پشتیبان از فایل فعلی ناموفق بود؛ بازگردانی انجام نشد."
+                        )
+                    }
+
+                    // بررسی مجدد فایل قبل از نوشتن نسخه تاریخی
+
+                    val latestBytes = target.readBytes()
+
+                    if (
+                        calculateHash(latestBytes) != currentHash
+                    ) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "فایل هنگام آماده‌سازی بازگردانی تغییر کرده است؛ عملیات متوقف شد."
+                        )
+                    }
+
+                    // نوشتن نسخه تاریخی
+
+                    val restored = writeAtomically(
+                        target,
+                        historicalBytes
+                    )
+
+                    if (!restored) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "نوشتن نسخه تاریخی ناموفق بود. پشتیبان وضعیت فعلی حفظ شده است."
+                        )
+                    }
+
+                    // بررسی نتیجه بازگردانی
+
+                    val finalBytes = target.readBytes()
+
+                    val restoreVerified =
+                        finalBytes.isNotEmpty() &&
+                                finalBytes.size <= MAX_FILE_SIZE &&
+                                calculateHash(finalBytes) == originalHash
+
+                    if (!restoreVerified) {
+
+                        val rollbackSucceeded = writeAtomically(
+                            target,
+                            currentBytes
+                        )
+
+                        if (rollbackSucceeded) {
+
+                            val rollbackBytes = target.readBytes()
+
+                            if (
+                                calculateHash(rollbackBytes) == currentHash
+                            ) {
+                                return@synchronized ProjectFileRestoreResult.Rejected(
+                                    "بررسی بازگردانی ناموفق بود؛ وضعیت قبلی فایل بازیابی شد."
+                                )
+                            }
+                        }
+
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "بررسی بازگردانی ناموفق بود و بازیابی وضعیت قبلی نیز تأیید نشد. پشتیبان وضعیت قبلی حفظ شده است."
+                        )
+                    }
+
+                    // ثبت تاریخچه برای امکان بازگشت از نسخه تاریخی
+
+                    val safetyManifestJson = JSONObject().apply {
+
+                        put("projectPath", projectRoot.path)
+                        put("filePath", target.path)
+
+                        // محتوای پشتیبان، وضعیت قبل از بازگردانی است.
+                        put("originalHash", currentHash)
+
+                        // وضعیت جدید فایل، نسخه تاریخی انتخاب‌شده است.
+                        put("appliedHash", originalHash)
+
+                        put("backupId", newBackupId)
+
+                        put(
+                            "createdAt",
+                            System.currentTimeMillis()
+                        )
+                    }
+
+                    if (
+                        !writeManifest(
+                            safetyManifest,
+                            safetyManifestJson
+                        )
+                    ) {
+
+                        val rollbackSucceeded = writeAtomically(
+                            target,
+                            currentBytes
+                        )
+
+                        if (rollbackSucceeded) {
+
+                            val rollbackBytes = target.readBytes()
+
+                            if (
+                                calculateHash(rollbackBytes) == currentHash
+                            ) {
+                                return@synchronized ProjectFileRestoreResult.Rejected(
+                                    "ثبت تاریخچه بازگردانی ناموفق بود؛ وضعیت قبلی فایل بازیابی شد."
+                                )
+                            }
+                        }
+
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "ثبت تاریخچه ناموفق بود. پشتیبان وضعیت قبلی حفظ شده است؛ وضعیت فایل را بررسی کنید."
+                        )
+                    }
+
+                    ProjectFileRestoreResult.Restored(
+                        filePath = target.path
+                    )
+
+                } catch (e: Exception) {
+
+                    ProjectFileRestoreResult.Rejected(
+                        e.message ?: "خطای نامشخص هنگام بازگردانی نسخه تاریخی."
+                    )
+                }
+            }
+        }
+
+    // -------------------------------------------------
+    // بازگردانی امن نسخه پشتیبان قبلی
+    // مخصوص آخرین اصلاحی که هش فعلی با آن مطابقت دارد
     // -------------------------------------------------
 
     suspend fun restoreBackup(
