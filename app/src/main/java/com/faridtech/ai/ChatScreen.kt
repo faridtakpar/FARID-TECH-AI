@@ -35,19 +35,23 @@ fun ChatScreen(
     onExternalPickerStateChanged: (Boolean) -> Unit
 ) {
 
+    val appContext = remember(context) {
+        context.applicationContext
+    }
+
     val prefs = remember {
-        context.getSharedPreferences(
+        appContext.getSharedPreferences(
             "farid_chat",
             Context.MODE_PRIVATE
         )
     }
 
     val downloader = remember {
-        ModelDownloader(context)
+        ModelDownloader(appContext)
     }
 
     val engine = remember {
-        LocalAIEngine(context)
+        LocalAIEngine(appContext)
     }
 
     val scope = rememberCoroutineScope()
@@ -152,7 +156,7 @@ fun ChatScreen(
             .apply()
     }
 
-    // Build a prompt using recent conversation messages.
+    // Build conversation prompt.
     fun buildConversationPrompt(): String {
 
         val systemMessage =
@@ -204,7 +208,7 @@ fun ChatScreen(
         }
     }
 
-    // Detect native and Kotlin engine errors.
+    // Detect engine errors.
     fun isEngineError(response: String): Boolean {
 
         val normalized = response.trim()
@@ -252,28 +256,36 @@ fun ChatScreen(
 
             onExternalPickerStateChanged(false)
 
-            if (uri != null) {
+            if (uri != null && !transferring) {
+
+                transferring = true
 
                 scope.launch {
-
-                    transferring = true
 
                     downloadStatus =
                         "در حال ساخت نسخه پشتیبان..."
 
-                    val success = try {
-                        engine.exportModelTo(uri)
-                    } catch (_: Exception) {
-                        false
-                    }
+                    try {
 
-                    downloadStatus = if (success) {
-                        "نسخه پشتیبان مدل ذخیره شد."
-                    } else {
-                        "ذخیره نسخه پشتیبان ناموفق بود."
-                    }
+                        val success =
+                            engine.exportModelTo(uri)
 
-                    transferring = false
+                        downloadStatus = if (success) {
+                            "نسخه پشتیبان مدل ذخیره شد."
+                        } else {
+                            "ذخیره نسخه پشتیبان ناموفق بود."
+                        }
+
+                    } catch (e: Exception) {
+
+                        downloadStatus =
+                            "خطا در پشتیبان‌گیری: ${
+                                e.message ?: "خطای نامشخص"
+                            }"
+
+                    } finally {
+                        transferring = false
+                    }
                 }
             }
         }
@@ -286,32 +298,42 @@ fun ChatScreen(
 
             onExternalPickerStateChanged(false)
 
-            if (uri != null) {
+            if (uri != null && !transferring) {
+
+                transferring = true
 
                 scope.launch {
-
-                    transferring = true
 
                     downloadStatus =
                         "در حال بازیابی مدل..."
 
-                    val success = try {
-                        engine.importModelFrom(uri)
-                    } catch (_: Exception) {
-                        false
+                    try {
+
+                        val success =
+                            engine.importModelFrom(uri)
+
+                        modelReady = engine.checkModel()
+
+                        downloadStatus = if (
+                            success && modelReady
+                        ) {
+                            "مدل با موفقیت بازیابی شد."
+                        } else {
+                            "بازیابی ناموفق بود؛ فایل را بررسی کنید."
+                        }
+
+                    } catch (e: Exception) {
+
+                        modelReady = engine.checkModel()
+
+                        downloadStatus =
+                            "خطا در بازیابی مدل: ${
+                                e.message ?: "خطای نامشخص"
+                            }"
+
+                    } finally {
+                        transferring = false
                     }
-
-                    modelReady = engine.checkModel()
-
-                    downloadStatus = if (
-                        success && modelReady
-                    ) {
-                        "مدل با موفقیت بازیابی شد."
-                    } else {
-                        "بازیابی ناموفق بود؛ فایل را بررسی کنید."
-                    }
-
-                    transferring = false
                 }
             }
         }
@@ -341,7 +363,7 @@ fun ChatScreen(
                 "پاسخ غیرمنتظره از موتور بومی: $result"
             }
 
-        } catch (e: Throwable) {
+        } catch (e: Exception) {
 
             "خطا در اتصال موتور بومی: ${
                 e.message ?: e.javaClass.simpleName
@@ -361,11 +383,12 @@ fun ChatScreen(
             return
         }
 
-        scope.launch {
+        // Set state before launching coroutine.
+        downloading = true
+        downloadProgress = 0
+        downloadStatus = "در حال دانلود مدل..."
 
-            downloading = true
-            downloadStatus = "در حال دانلود مدل..."
-            downloadProgress = 0
+        scope.launch {
 
             try {
 
@@ -378,7 +401,6 @@ fun ChatScreen(
                                 .toInt()
                                 .coerceIn(0, 100)
 
-                        // Update Compose state on the main thread.
                         scope.launch(Dispatchers.Main.immediate) {
                             downloadProgress = progress
                         }
@@ -447,9 +469,10 @@ fun ChatScreen(
 
         saveHistory()
 
-        scope.launch {
+        // Lock generation before launching coroutine.
+        generating = true
 
-            generating = true
+        scope.launch {
 
             nativeStatus =
                 "در حال آماده‌سازی پاسخ..."
@@ -698,20 +721,27 @@ fun ChatScreen(
 
                         onClick = {
 
-                            onExternalPickerStateChanged(true)
+                            if (
+                                !downloading &&
+                                !transferring &&
+                                !generating
+                            ) {
 
-                            try {
+                                onExternalPickerStateChanged(true)
 
-                                backupLauncher.launch(
-                                    "FARID-TECH-Qwen2.5-Coder-1.5B.gguf"
-                                )
+                                try {
 
-                            } catch (_: Exception) {
+                                    backupLauncher.launch(
+                                        "FARID-TECH-Qwen2.5-Coder-1.5B.gguf"
+                                    )
 
-                                onExternalPickerStateChanged(false)
+                                } catch (_: Exception) {
 
-                                downloadStatus =
-                                    "بازکردن محل ذخیره ناموفق بود."
+                                    onExternalPickerStateChanged(false)
+
+                                    downloadStatus =
+                                        "بازکردن محل ذخیره ناموفق بود."
+                                }
                             }
                         },
 
@@ -730,20 +760,27 @@ fun ChatScreen(
 
                         onClick = {
 
-                            onExternalPickerStateChanged(true)
+                            if (
+                                !downloading &&
+                                !transferring &&
+                                !generating
+                            ) {
 
-                            try {
+                                onExternalPickerStateChanged(true)
 
-                                restoreLauncher.launch(
-                                    arrayOf("*/*")
-                                )
+                                try {
 
-                            } catch (_: Exception) {
+                                    restoreLauncher.launch(
+                                        arrayOf("*/*")
+                                    )
 
-                                onExternalPickerStateChanged(false)
+                                } catch (_: Exception) {
 
-                                downloadStatus =
-                                    "بازکردن انتخاب‌گر فایل ناموفق بود."
+                                    onExternalPickerStateChanged(false)
+
+                                    downloadStatus =
+                                        "بازکردن انتخاب‌گر فایل ناموفق بود."
+                                }
                             }
                         },
 
@@ -811,7 +848,10 @@ fun ChatScreen(
     }
 
     // Automatically scroll to the latest message.
-    LaunchedEffect(messages.size) {
+    LaunchedEffect(
+        messages.size,
+        messages.lastOrNull()?.text
+    ) {
 
         if (messages.isNotEmpty()) {
 
