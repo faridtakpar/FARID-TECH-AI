@@ -6,7 +6,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -14,7 +14,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -53,6 +52,7 @@ fun AppBuilderScreen(
 
     var dialogTarget by remember { mutableStateOf<File?>(null) }
     var renameValue by remember { mutableStateOf("") }
+
     var showRenameDialog by remember { mutableStateOf(false) }
     var showDeleteDialog by remember { mutableStateOf(false) }
 
@@ -72,15 +72,13 @@ fun AppBuilderScreen(
     )
 
     fun isEditable(file: File): Boolean {
-        val extension = file.extension.lowercase()
-        return extension in editableExtensions
+        return file.extension.lowercase() in editableExtensions
     }
 
     fun isInsideProject(file: File, root: File): Boolean {
         return try {
-            val rootPath = root.canonicalFile.toPath()
-            val filePath = file.canonicalFile.toPath()
-            filePath.startsWith(rootPath) && filePath != rootPath
+            file.canonicalFile.toPath()
+                .startsWith(root.canonicalFile.toPath())
         } catch (_: Exception) {
             false
         }
@@ -101,10 +99,7 @@ fun AppBuilderScreen(
 
                 children.forEach { child ->
                     result.add(
-                        ProjectTreeEntry(
-                            file = child,
-                            depth = depth
-                        )
+                        ProjectTreeEntry(child, depth)
                     )
 
                     if (child.isDirectory) {
@@ -187,14 +182,6 @@ fun AppBuilderScreen(
             return
         }
 
-        val safeName = projectName.trim()
-            .replace(Regex("[^a-zA-Z0-9_-]"), "_")
-
-        if (safeName.isBlank()) {
-            error = "نام پروژه معتبر نیست."
-            return
-        }
-
         loading = true
         error = ""
         message = ""
@@ -202,208 +189,25 @@ fun AppBuilderScreen(
         scope.launch {
             try {
                 val folder = withContext(Dispatchers.IO) {
-                    val root = File(context.filesDir, "projects")
-
-                    if (!root.exists() && !root.mkdirs()) {
-                        throw IllegalStateException(
-                            "ساخت پوشه پروژه‌ها ناموفق بود."
-                        )
-                    }
-
-                    val project = File(root, safeName)
-
-                    if (project.exists()) {
-                        throw IllegalStateException(
-                            "پروژه‌ای با این نام از قبل وجود دارد."
-                        )
-                    }
-
-                    if (!project.mkdirs()) {
-                        throw IllegalStateException(
-                            "ساخت پوشه پروژه ناموفق بود."
-                        )
-                    }
-
-                    val sourceFolder = File(
-                        project,
-                        "app/src/main"
+                    AndroidProjectTemplate.create(
+                        context = context,
+                        projectName = projectName.trim(),
+                        packageName = packageName.trim(),
+                        language = language
                     )
-
-                    val javaFolder = File(
-                        sourceFolder,
-                        "java/${packageName.replace(".", "/")}"
-                    )
-
-                    val resFolder = File(sourceFolder, "res")
-
-                    if (!javaFolder.mkdirs() || !resFolder.mkdirs()) {
-                        throw IllegalStateException(
-                            "ساخت ساختار اولیه پروژه ناموفق بود."
-                        )
-                    }
-
-                    val activityFile = File(
-                        javaFolder,
-                        if (language == "Kotlin") {
-                            "MainActivity.kt"
-                        } else {
-                            "MainActivity.java"
-                        }
-                    )
-
-                    val activityCode = if (language == "Kotlin") {
-                        """
-package $packageName
-
-import android.app.Activity
-import android.os.Bundle
-import android.widget.TextView
-
-class MainActivity : Activity() {
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-
-        val title = TextView(this).apply {
-            text = "Hello from FARID TECH AI"
-            textSize = 22f
-            setPadding(32, 32, 32, 32)
-        }
-
-        setContentView(title)
-    }
-}
-                        """.trimIndent()
-                    } else {
-                        """
-package $packageName;
-
-import android.app.Activity;
-import android.os.Bundle;
-import android.widget.TextView;
-
-public class MainActivity extends Activity {
-
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-
-        TextView title = new TextView(this);
-        title.setText("Hello from FARID TECH AI");
-        title.setTextSize(22);
-        title.setPadding(32, 32, 32, 32);
-
-        setContentView(title);
-    }
-}
-                        """.trimIndent()
-                    }
-
-                    activityFile.writeText(activityCode)
-
-                    File(
-                        sourceFolder,
-                        "AndroidManifest.xml"
-                    ).writeText(
-                        """
-<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
-    <application
-        android:label="$safeName"
-        android:theme="@android:style/Theme.Material.Light.NoActionBar">
-
-        <activity
-            android:name="$packageName.MainActivity"
-            android:exported="true">
-
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-
-        </activity>
-
-    </application>
-
-</manifest>
-                        """.trimIndent()
-                    )
-
-                    File(
-                        project,
-                        "build.gradle.kts"
-                    ).writeText(
-                        """
-plugins {
-    id("com.android.application")
-    ${if (language == "Kotlin") "id(\"org.jetbrains.kotlin.android\")" else ""}
-}
-
-android {
-    namespace = "$packageName"
-    compileSdk = 35
-
-    defaultConfig {
-        applicationId = "$packageName"
-        minSdk = 26
-        targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
-    }
-}
-                        """.trimIndent()
-                    )
-
-                    File(
-                        project,
-                        "settings.gradle.kts"
-                    ).writeText(
-                        """
-pluginManagement {
-    repositories {
-        google()
-        mavenCentral()
-        gradlePluginPortal()
-    }
-}
-
-dependencyResolutionManagement {
-    repositoriesMode.set(
-        RepositoriesMode.FAIL_ON_PROJECT_REPOS
-    )
-    repositories {
-        google()
-        mavenCentral()
-    }
-}
-
-rootProject.name = "$safeName"
-include(":app")
-                        """.trimIndent()
-                    )
-
-                    File(
-                        project,
-                        "gradle.properties"
-                    ).writeText(
-                        """
-org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
-android.useAndroidX=true
-                        """.trimIndent()
-                    )
-
-                    project
                 }
 
                 projectFolder = folder
                 currentDirectory = folder
                 selectedFile = null
                 editorText = ""
+
                 entries = scanProject(folder)
-                message = "پروژه و ساختار اولیه آن ایجاد شد."
+
+                message = "پروژه با قالب استاندارد ساخته شد."
+
             } catch (e: Exception) {
-                error = e.message ?: "خطا در ساخت پروژه."
+                error = e.message ?: "ساخت پروژه ناموفق بود."
             } finally {
                 loading = false
             }
@@ -449,26 +253,27 @@ android.useAndroidX=true
                         target.createNewFile()
                     }
 
-                    if (!success) {
-                        throw IllegalStateException(
-                            "ساخت فایل یا پوشه ناموفق بود."
-                        )
+                    check(success) {
+                        "ساخت فایل یا پوشه ناموفق بود."
                     }
                 }
 
-                newItemName = ""
                 entries = scanProject(root)
+                newItemName = ""
+
                 message = if (newItemIsFolder) {
                     "پوشه جدید ساخته شد."
                 } else {
                     "فایل جدید ساخته شد."
                 }
+
                 error = ""
 
                 if (!newItemIsFolder && isEditable(target)) {
                     selectedFile = target
                     editorText = ""
                 }
+
             } catch (e: Exception) {
                 error = e.message ?: "عملیات ناموفق بود."
             }
@@ -509,24 +314,25 @@ android.useAndroidX=true
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    if (!target.renameTo(destination)) {
-                        throw IllegalStateException(
-                            "تغییر نام انجام نشد."
-                        )
+                    check(target.renameTo(destination)) {
+                        "تغییر نام انجام نشد."
                     }
                 }
 
                 selectedFile = null
                 editorText = ""
+
                 currentDirectory = currentDirectory?.let {
                     if (it == target) destination else it
                 }
 
                 entries = scanProject(root)
+
                 showRenameDialog = false
                 dialogTarget = null
                 message = "تغییر نام با موفقیت انجام شد."
                 error = ""
+
             } catch (e: Exception) {
                 error = e.message ?: "تغییر نام ناموفق بود."
             }
@@ -546,30 +352,34 @@ android.useAndroidX=true
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    if (!target.deleteRecursively()) {
-                        throw IllegalStateException(
-                            "حذف فایل یا پوشه ناموفق بود."
-                        )
+                    check(target.deleteRecursively()) {
+                        "حذف فایل یا پوشه ناموفق بود."
                     }
                 }
 
                 selectedFile = null
                 editorText = ""
 
+                val directory = currentDirectory
+
                 if (
-                    currentDirectory != null &&
-                    (currentDirectory == target ||
-                        currentDirectory!!.toPath()
-                            .startsWith(target.toPath()))
+                    directory != null &&
+                    isInsideProject(directory, root) &&
+                    (
+                        directory == target ||
+                        directory.toPath().startsWith(target.toPath())
+                    )
                 ) {
                     currentDirectory = root
                 }
 
                 entries = scanProject(root)
+
                 showDeleteDialog = false
                 dialogTarget = null
                 message = "حذف با موفقیت انجام شد."
                 error = ""
+
             } catch (e: Exception) {
                 error = e.message ?: "حذف انجام نشد."
             }
@@ -595,11 +405,12 @@ android.useAndroidX=true
         )
 
         Text(
-            "ایجاد پروژه و مدیریت فایل‌های اندروید",
+            "ساخت پروژه اندروید و مدیریت فایل‌ها",
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
 
         if (projectFolder == null) {
+
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(22.dp)
@@ -608,6 +419,7 @@ android.useAndroidX=true
                     modifier = Modifier.padding(18.dp),
                     verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
+
                     Text(
                         "پروژه جدید",
                         style = MaterialTheme.typography.titleLarge,
@@ -678,7 +490,9 @@ android.useAndroidX=true
                     }
                 }
             }
+
         } else {
+
             val root = projectFolder!!
 
             Card(
@@ -689,6 +503,7 @@ android.useAndroidX=true
                     modifier = Modifier.padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+
                     Text(
                         projectName,
                         style = MaterialTheme.typography.titleLarge,
@@ -706,7 +521,7 @@ android.useAndroidX=true
                     )
 
                     Text(
-                        "فضای ذخیره‌سازی داخلی برنامه",
+                        "قالب استاندارد Android Gradle",
                         style = MaterialTheme.typography.bodySmall
                     )
 
@@ -717,6 +532,8 @@ android.useAndroidX=true
                             selectedFile = null
                             entries = emptyList()
                             editorText = ""
+                            error = ""
+                            message = ""
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
@@ -735,6 +552,7 @@ android.useAndroidX=true
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+
                 OutlinedButton(
                     onClick = {
                         currentDirectory = root
@@ -749,8 +567,10 @@ android.useAndroidX=true
                 OutlinedButton(
                     onClick = {
                         val parent = currentDirectory?.parentFile
-                        if (parent != null && parent == root ||
-                            parent != null && isInsideProject(parent, root)
+
+                        if (
+                            parent != null &&
+                            (parent == root || isInsideProject(parent, root))
                         ) {
                             currentDirectory = parent
                             selectedFile = null
@@ -765,7 +585,12 @@ android.useAndroidX=true
 
             Text(
                 "مسیر فعلی: " +
-                    (currentDirectory?.relativeToOrNull(root)?.path ?: "ریشه پروژه"),
+                    (
+                        currentDirectory
+                            ?.relativeToOrNull(root)
+                            ?.path
+                            ?: "ریشه پروژه"
+                    ),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall
             )
@@ -778,7 +603,9 @@ android.useAndroidX=true
                     modifier = Modifier.padding(10.dp),
                     verticalArrangement = Arrangement.spacedBy(5.dp)
                 ) {
+
                     entries.forEach { entry ->
+
                         val file = entry.file
 
                         Row(
@@ -800,6 +627,7 @@ android.useAndroidX=true
                                 ),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
+
                             TextButton(
                                 onClick = {
                                     if (file.isDirectory) {
@@ -879,11 +707,7 @@ android.useAndroidX=true
                 },
                 placeholder = {
                     Text(
-                        if (newItemIsFolder) {
-                            "utils"
-                        } else {
-                            "MyFile.kt"
-                        }
+                        if (newItemIsFolder) "utils" else "MyFile.kt"
                     )
                 },
                 singleLine = true
@@ -920,19 +744,36 @@ android.useAndroidX=true
                 fontWeight = FontWeight.Bold
             )
 
-            OutlinedTextField(
-                value = editorText,
-                onValueChange = { editorText = it },
+            Card(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(330.dp),
-                placeholder = {
-                    Text("کد برنامه را اینجا وارد کنید...")
-                },
-                textStyle = MaterialTheme.typography.bodySmall.copy(
-                    fontFamily = FontFamily.Monospace
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                BasicTextField(
+                    value = editorText,
+                    onValueChange = { editorText = it },
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(12.dp),
+                    textStyle = MaterialTheme.typography.bodySmall.copy(
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurface
+                    ),
+                    decorationBox = { innerTextField ->
+                        Box {
+                            if (editorText.isEmpty()) {
+                                Text(
+                                    "کد برنامه را اینجا وارد کنید...",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+
+                            innerTextField()
+                        }
+                    }
                 )
-            )
+            }
 
             Button(
                 onClick = { saveFile() },
@@ -960,7 +801,7 @@ android.useAndroidX=true
                     )
 
                     Text(
-                        "مدیریت فایل‌ها در این مرحله فراهم شده است. اجرای Gradle و تولید APK هنوز به ابزار ساخت اندروید متصل نشده است.",
+                        "قالب استاندارد پروژه متصل شده است. اجرای Gradle و تولید APK هنوز به سیستم ساخت متصل نشده است.",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
