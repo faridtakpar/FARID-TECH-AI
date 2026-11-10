@@ -304,7 +304,10 @@ fun ProgrammingScreen(
         restoringBackup ||
         loadingFile
 
-    // بارگذاری تاریخچه با مدیر واقعی پشتیبان‌گیری
+    // -------------------------------------------------
+    // تازه‌سازی تاریخچه
+    // -------------------------------------------------
+
     fun refreshBackupHistory() {
         val root = projectRoot ?: return
 
@@ -329,6 +332,10 @@ fun ProgrammingScreen(
         }
     }
 
+    // -------------------------------------------------
+    // بررسی مدل هوش مصنوعی
+    // -------------------------------------------------
+
     LaunchedEffect(engine) {
         checkingModel = true
 
@@ -340,6 +347,10 @@ fun ProgrammingScreen(
 
         checkingModel = false
     }
+
+    // -------------------------------------------------
+    // بارگذاری اطلاعات پروژه
+    // -------------------------------------------------
 
     LaunchedEffect(projectRoot) {
         projectFiles.clear()
@@ -388,6 +399,10 @@ fun ProgrammingScreen(
             loadingBackupHistory = false
         }
     }
+
+    // -------------------------------------------------
+    // انتخاب فایل پروژه
+    // -------------------------------------------------
 
     fun selectProjectFile(file: File) {
         if (busy) return
@@ -445,6 +460,10 @@ fun ProgrammingScreen(
             }
         }
     }
+
+    // -------------------------------------------------
+    // ارسال درخواست به هوش مصنوعی
+    // -------------------------------------------------
 
     fun sendRequest() {
         if (busy) return
@@ -659,6 +678,10 @@ fun ProgrammingScreen(
         }
     }
 
+    // -------------------------------------------------
+    // تأیید و اعمال اصلاح پیشنهادی
+    // -------------------------------------------------
+
     fun confirmProjectChange() {
         val preview = pendingChange ?: return
 
@@ -706,6 +729,10 @@ fun ProgrammingScreen(
             }
         }
     }
+
+    // -------------------------------------------------
+    // بازگردانی آخرین اصلاح
+    // -------------------------------------------------
 
     fun restoreLastChange() {
         val backup = lastBackupPath ?: return
@@ -767,6 +794,113 @@ fun ProgrammingScreen(
             }
         }
     }
+
+    // -------------------------------------------------
+    // بازگردانی نسخه تاریخی انتخاب‌شده
+    // -------------------------------------------------
+
+    fun restoreHistoricalVersion(entry: ProjectBackupEntry) {
+
+        val root = projectRoot ?: run {
+            errorMessage = "پروژه انتخاب‌شده معتبر نیست."
+            return
+        }
+
+        if (restoringBackup || applyingChange || generating) {
+            return
+        }
+
+        if (!entry.isValid) {
+            errorMessage =
+                "این نسخه سالم نیست و امکان بازگردانی آن وجود ندارد."
+            return
+        }
+
+        val target = File(entry.filePath)
+
+        // وضعیت عملیات بلافاصله فعال می‌شود تا از اجرای تکراری جلوگیری شود.
+        restoringBackup = true
+        errorMessage = ""
+        backupHistoryError = ""
+
+        scope.launch {
+            try {
+
+                val restoreResult = changeManager.restoreHistoricalBackup(
+                    project = root,
+                    file = target,
+                    backupPath = entry.backupPath,
+                    ownerConfirmed = true
+                )
+
+                when (restoreResult) {
+
+                    is ProjectFileRestoreResult.Restored -> {
+
+                        // خواندن محتوای نسخه بازگردانی‌شده
+                        val restoredContent =
+                            withContext(Dispatchers.IO) {
+
+                                if (!isSafeProjectFile(root, target)) {
+                                    throw SecurityException(
+                                        "فایل بازگردانی‌شده در مسیر مجاز قرار ندارد."
+                                    )
+                                }
+
+                                target.readText(Charsets.UTF_8)
+                            }
+
+                        // به‌روزرسانی ویرایشگر فقط اگر همین فایل انتخاب شده باشد.
+                        val selectedFileMatches = try {
+                            selectedProjectFile?.canonicalPath ==
+                                target.canonicalPath
+                        } catch (_: Exception) {
+                            false
+                        }
+
+                        if (selectedFileMatches) {
+                            code = restoredContent
+                        }
+
+                        // نسخه بازگردانی‌شده اکنون وضعیت فعلی فایل است.
+                        lastBackupPath = null
+                        undoTargetFile = null
+                        showRestoreConfirmation = false
+
+                        result =
+                            "نسخه تاریخی با موفقیت بازگردانی شد."
+
+                        projectError =
+                            "نسخه فعلی قبل از بازگردانی نیز به‌عنوان پشتیبان ذخیره شد."
+
+                        // تازه‌سازی تاریخچه برای نمایش پشتیبان جدید
+                        val updatedHistory =
+                            withContext(Dispatchers.IO) {
+                                changeManager.getProjectHistory(root)
+                            }
+
+                        backupHistory.clear()
+                        backupHistory.addAll(updatedHistory)
+
+                    }
+
+                    is ProjectFileRestoreResult.Rejected -> {
+                        errorMessage = restoreResult.reason
+                    }
+                }
+
+            } catch (e: Exception) {
+                errorMessage =
+                    e.message ?: "بازگردانی نسخه تاریخی ناموفق بود."
+            } finally {
+                restoringBackup = false
+            }
+        }
+    }
+
+    // -------------------------------------------------
+    // رابط کاربری
+    // -------------------------------------------------
 
     Column(
         modifier = Modifier
@@ -951,7 +1085,7 @@ fun ProgrammingScreen(
                                 onClick = {
                                     refreshBackupHistory()
                                 },
-                                enabled = !loadingBackupHistory
+                                enabled = !loadingBackupHistory && !busy
                             ) {
                                 Text("به‌روزرسانی")
                             }
@@ -1329,7 +1463,10 @@ fun ProgrammingScreen(
         }
     }
 
+    // -------------------------------------------------
     // پنجره انتخاب فایل پروژه
+    // -------------------------------------------------
+
     if (showProjectFiles) {
         AlertDialog(
             onDismissRequest = {
@@ -1396,7 +1533,10 @@ fun ProgrammingScreen(
         )
     }
 
-    // پنجره تاریخچه نسخه‌های پشتیبان
+    // -------------------------------------------------
+    // پنجره تاریخچه و بازگردانی نسخه‌های قدیمی
+    // -------------------------------------------------
+
     if (showBackupHistory) {
         ProjectBackupHistoryDialog(
             history = backupHistory,
@@ -1404,13 +1544,22 @@ fun ProgrammingScreen(
             error = backupHistoryError.ifBlank {
                 null
             },
+            restoring = restoringBackup,
+            onRestore = { entry ->
+                restoreHistoricalVersion(entry)
+            },
             onDismiss = {
-                showBackupHistory = false
+                if (!restoringBackup) {
+                    showBackupHistory = false
+                }
             }
         )
     }
 
+    // -------------------------------------------------
     // پنجره بازبینی و تأیید اصلاح
+    // -------------------------------------------------
+
     val preview = pendingChange
 
     if (showChangeReview && preview != null) {
@@ -1433,7 +1582,10 @@ fun ProgrammingScreen(
         )
     }
 
+    // -------------------------------------------------
     // تأیید جداگانه برای بازگردانی آخرین نسخه
+    // -------------------------------------------------
+
     if (showRestoreConfirmation) {
         AlertDialog(
             onDismissRequest = {
