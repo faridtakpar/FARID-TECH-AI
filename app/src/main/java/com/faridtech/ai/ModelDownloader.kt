@@ -16,9 +16,18 @@ internal object ModelStorageCoordinator {
     val engineMutex = Mutex()
     val downloadMutex = Mutex()
 
-    // وضعیت مشترک مدل بارگذاری‌شده در موتور Native
+    // مسیر مدل بارگذاری‌شده در موتور Native
     @Volatile
     var loadedModelPath: String? = null
+
+    /**
+     * فقط زمانی فراخوانی شود که engineMutex در اختیار باشد.
+     * حتی اگر مسیر Kotlin خالی باشد، موتور Native آزاد می‌شود.
+     */
+    fun releaseLoadedModelLocked() {
+        NativeLlama().nativeRelease()
+        loadedModelPath = null
+    }
 }
 
 class ModelDownloader(context: Context) {
@@ -102,14 +111,6 @@ class ModelDownloader(context: Context) {
     /**
      * فقط در حالی فراخوانی شود که engineMutex در اختیار باشد.
      */
-    private fun releaseNativeModelLocked() {
-        NativeLlama().nativeRelease()
-        ModelStorageCoordinator.loadedModelPath = null
-    }
-
-    /**
-     * فقط در حالی فراخوانی شود که engineMutex در اختیار باشد.
-     */
     private fun restoreBackupIfNeeded(): Boolean {
 
         if (!backupFile.exists()) {
@@ -120,8 +121,7 @@ class ModelDownloader(context: Context) {
             return false
         }
 
-        // قبل از بازیابی فایل، وضعیت موتور Native پاک می‌شود.
-        releaseNativeModelLocked()
+        ModelStorageCoordinator.releaseLoadedModelLocked()
 
         return backupFile.renameTo(finalFile)
     }
@@ -141,19 +141,21 @@ class ModelDownloader(context: Context) {
                 )
             }
 
-            // اگر مدل کامل موجود است، نیازی به دانلود نیست.
-            if (isCompleteModel(finalFile)) {
-                return@withLock finalFile
-            }
+            // بررسی مدل و نسخه پشتیبان با قفل مشترک موتور
+            val alreadyComplete =
+                ModelStorageCoordinator.engineMutex.withLock {
 
-            // بررسی و بازیابی نسخه پشتیبان
-            ModelStorageCoordinator.engineMutex.withLock {
+                    if (!restoreBackupIfNeeded()) {
+                        throw IllegalStateException(
+                            "نسخه پشتیبان قبلی وجود دارد؛ وضعیت فایل‌ها نیاز به بررسی دارد."
+                        )
+                    }
 
-                if (!restoreBackupIfNeeded()) {
-                    throw IllegalStateException(
-                        "نسخه پشتیبان قبلی وجود دارد؛ وضعیت فایل‌ها نیاز به بررسی دارد."
-                    )
+                    isCompleteModel(finalFile)
                 }
+
+            if (alreadyComplete) {
+                return@withLock finalFile
             }
 
             if (backupFile.exists()) {
@@ -380,8 +382,8 @@ class ModelDownloader(context: Context) {
 
                         try {
 
-                            // آزادسازی موتور پیش از تغییر فایل مدل
-                            releaseNativeModelLocked()
+                            // آزادسازی Native پیش از تغییر فایل مدل
+                            ModelStorageCoordinator.releaseLoadedModelLocked()
 
                             if (finalFile.exists()) {
 
@@ -437,7 +439,6 @@ class ModelDownloader(context: Context) {
                                 backupFile.renameTo(finalFile)
                             }
 
-                            // موتور آزاد مانده است؛ مسیر مشترک نیز پاک می‌ماند.
                             ModelStorageCoordinator.loadedModelPath = null
 
                             throw e
