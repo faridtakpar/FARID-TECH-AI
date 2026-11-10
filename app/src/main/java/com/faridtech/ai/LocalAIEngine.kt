@@ -8,8 +8,9 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.RandomAccessFile
+import java.util.Locale
 
-class LocalAIEngine(private val context: Context) {
+class LocalAIEngine(context: Context) {
 
     companion object {
         private const val MODEL_NAME =
@@ -24,28 +25,32 @@ class LocalAIEngine(private val context: Context) {
             "مدل با موفقیت بارگذاری شد."
     }
 
+    private val appContext = context.applicationContext
     private val native = NativeLlama()
 
-    // Shared lock with ModelDownloader.
     private val engineMutex =
         ModelStorageCoordinator.engineMutex
-
-    @Volatile
-    private var loadedModelPath: String? = null
 
     private val modelFile: File
         get() {
             val directory =
-                context.getExternalFilesDir(null) ?: context.filesDir
+                appContext.getExternalFilesDir(null)
+                    ?: appContext.filesDir
 
             return File(directory, "models/$MODEL_NAME")
         }
 
     private val temporaryFile: File
-        get() = File(modelFile.parentFile, "$MODEL_NAME.importing")
+        get() = File(
+            modelFile.parentFile,
+            "$MODEL_NAME.importing"
+        )
 
     private val backupFile: File
-        get() = File(modelFile.parentFile, "$MODEL_NAME.previous")
+        get() = File(
+            modelFile.parentFile,
+            "$MODEL_NAME.previous"
+        )
 
     private fun hasValidGgufHeader(file: File): Boolean {
         if (
@@ -70,7 +75,9 @@ class LocalAIEngine(private val context: Context) {
                     return@use false
                 }
 
-                val version = Integer.reverseBytes(input.readInt())
+                val version =
+                    Integer.reverseBytes(input.readInt())
+
                 version in GGUF_VERSION_MIN..GGUF_VERSION_MAX
             }
         } catch (_: Exception) {
@@ -87,69 +94,96 @@ class LocalAIEngine(private val context: Context) {
         }
 
     fun getModelPath(): String? =
-        if (isModelAvailable()) modelFile.absolutePath else null
-
-    fun getModelDetails(): String {
-        val exists = modelFile.exists() && modelFile.isFile
-        val valid = exists && hasValidGgufHeader(modelFile)
-
-        val sizeMb = if (exists) {
-            "%.2f".format(
-                java.util.Locale.US,
-                modelFile.length() / (1024.0 * 1024.0)
-            )
+        if (isModelAvailable()) {
+            modelFile.absolutePath
         } else {
-            "0"
+            null
         }
 
-        return """
-            نام مدل:
-            $MODEL_NAME
+    suspend fun getModelDetails(): String =
+        withContext(Dispatchers.IO) {
+            engineMutex.withLock {
+                val exists =
+                    modelFile.exists() && modelFile.isFile
 
-            مسیر فایل:
-            ${modelFile.absolutePath}
+                val valid =
+                    exists && hasValidGgufHeader(modelFile)
 
-            حجم فایل:
-            $sizeMb MB
+                val sizeMb = if (exists) {
+                    String.format(
+                        Locale.US,
+                        "%.2f",
+                        modelFile.length() / (1024.0 * 1024.0)
+                    )
+                } else {
+                    "0"
+                }
 
-            وضعیت فایل:
-            ${if (!exists) "پیدا نشد" else if (valid) "معتبر" else "نامعتبر"}
+                val isLoaded =
+                    ModelStorageCoordinator.loadedModelPath ==
+                        modelFile.absolutePath
 
-            وضعیت بارگذاری:
-            ${if (loadedModelPath == modelFile.absolutePath) "بارگذاری شده" else "بارگذاری نشده"}
+                """
+                نام مدل:
+                $MODEL_NAME
 
-            نسخه پشتیبان:
-            ${if (backupFile.exists()) "موجود" else "وجود ندارد"}
+                مسیر فایل:
+                ${modelFile.absolutePath}
 
-            فایل موقت:
-            ${if (temporaryFile.exists()) "موجود" else "وجود ندارد"}
-        """.trimIndent()
-    }
+                حجم فایل:
+                $sizeMb MB
 
+                وضعیت فایل:
+                ${if (!exists) "پیدا نشد" else if (valid) "معتبر" else "نامعتبر"}
+
+                وضعیت بارگذاری:
+                ${if (isLoaded) "بارگذاری شده" else "بارگذاری نشده"}
+
+                نسخه پشتیبان:
+                ${if (backupFile.exists()) "موجود" else "وجود ندارد"}
+
+                فایل موقت:
+                ${if (temporaryFile.exists()) "موجود" else "وجود ندارد"}
+                """.trimIndent()
+            }
+        }
+
+    // Must only be called while engineMutex is held.
     private fun loadModelLocked(): String {
+
         if (!isModelAvailable()) {
-            loadedModelPath = null
+            ModelStorageCoordinator.loadedModelPath = null
+
             return "فایل مدل معتبر نیست یا حجم آن کافی نیست."
         }
 
         val path = modelFile.absolutePath
 
-        if (loadedModelPath == path) {
+        if (
+            ModelStorageCoordinator.loadedModelPath == path
+        ) {
             return LOAD_SUCCESS
         }
 
         return try {
+
+            // Release any previously loaded native model first.
+            ModelStorageCoordinator.releaseLoadedModelLocked()
+
             val result = native.nativeLoadModel(path)
 
             if (result == LOAD_SUCCESS) {
-                loadedModelPath = path
+                ModelStorageCoordinator.loadedModelPath = path
             } else {
-                loadedModelPath = null
+                ModelStorageCoordinator.loadedModelPath = null
             }
 
             result
+
         } catch (e: Exception) {
-            loadedModelPath = null
+
+            ModelStorageCoordinator.loadedModelPath = null
+
             "خطا در بارگذاری مدل: ${e.message ?: "نامشخص"}"
         }
     }
@@ -163,16 +197,23 @@ class LocalAIEngine(private val context: Context) {
 
     suspend fun generate(prompt: String): String =
         withContext(Dispatchers.IO) {
+
             if (prompt.isBlank()) {
                 return@withContext "لطفاً پیام خود را وارد کنید."
             }
 
             engineMutex.withLock {
+
                 if (!isModelAvailable()) {
+                    ModelStorageCoordinator.loadedModelPath = null
+
                     return@withLock "فایل مدل معتبر نیست یا نصب نشده است."
                 }
 
-                if (loadedModelPath != modelFile.absolutePath) {
+                if (
+                    ModelStorageCoordinator.loadedModelPath !=
+                    modelFile.absolutePath
+                ) {
                     val result = loadModelLocked()
 
                     if (result != LOAD_SUCCESS) {
@@ -181,11 +222,14 @@ class LocalAIEngine(private val context: Context) {
                 }
 
                 try {
+
                     native.nativeGenerate(
                         prompt,
                         MAX_GENERATION_TOKENS
                     )
+
                 } catch (e: Exception) {
+
                     "خطا در اجرای هوش مصنوعی: ${e.message ?: "نامشخص"}"
                 }
             }
@@ -194,30 +238,30 @@ class LocalAIEngine(private val context: Context) {
     suspend fun releaseModel() {
         withContext(Dispatchers.IO) {
             engineMutex.withLock {
-                try {
-                    native.nativeRelease()
-                } finally {
-                    loadedModelPath = null
-                }
+                ModelStorageCoordinator.releaseLoadedModelLocked()
             }
         }
     }
 
     suspend fun exportModelTo(uri: Uri): Boolean =
         withContext(Dispatchers.IO) {
+
             engineMutex.withLock {
+
                 if (!isModelAvailable()) {
                     return@withLock false
                 }
 
                 try {
+
                     val originalLength = modelFile.length()
 
-                    val output = context.contentResolver
+                    val output = appContext.contentResolver
                         .openOutputStream(uri, "w")
                         ?: return@withLock false
 
                     val copiedBytes = output.use { destination ->
+
                         modelFile.inputStream().use { source ->
                             source.copyTo(destination)
                         }
@@ -226,6 +270,7 @@ class LocalAIEngine(private val context: Context) {
                     copiedBytes == originalLength &&
                         modelFile.length() == originalLength &&
                         hasValidGgufHeader(modelFile)
+
                 } catch (_: Exception) {
                     false
                 }
@@ -234,11 +279,16 @@ class LocalAIEngine(private val context: Context) {
 
     suspend fun importModelFrom(uri: Uri): Boolean =
         withContext(Dispatchers.IO) {
+
             engineMutex.withLock {
+
                 val parent = modelFile.parentFile
                     ?: return@withLock false
 
-                if (!parent.exists() && !parent.mkdirs()) {
+                if (
+                    !parent.exists() &&
+                    !parent.mkdirs()
+                ) {
                     return@withLock false
                 }
 
@@ -250,6 +300,7 @@ class LocalAIEngine(private val context: Context) {
                 var newModelInstalled = false
 
                 try {
+
                     if (
                         temporaryFile.exists() &&
                         !temporaryFile.delete()
@@ -257,11 +308,12 @@ class LocalAIEngine(private val context: Context) {
                         return@withLock false
                     }
 
-                    val input = context.contentResolver
+                    val input = appContext.contentResolver
                         .openInputStream(uri)
                         ?: return@withLock false
 
                     input.use { source ->
+
                         temporaryFile.outputStream().use { destination ->
                             source.copyTo(destination)
                             destination.fd.sync()
@@ -275,69 +327,99 @@ class LocalAIEngine(private val context: Context) {
 
                     val requiredSpace =
                         temporaryFile.length() +
-                            if (modelFile.exists()) modelFile.length() else 0L
+                            if (modelFile.exists()) {
+                                modelFile.length()
+                            } else {
+                                0L
+                            }
 
                     if (parent.usableSpace < requiredSpace) {
                         temporaryFile.delete()
                         return@withLock false
                     }
 
-                    // Release native memory before replacing the model.
-                    native.nativeRelease()
-                    loadedModelPath = null
+                    // Release native model before replacing its file.
+                    ModelStorageCoordinator.releaseLoadedModelLocked()
 
                     if (modelFile.exists()) {
+
                         if (!modelFile.renameTo(backupFile)) {
                             temporaryFile.delete()
                             return@withLock false
                         }
+
                         oldModelMoved = true
                     }
 
                     if (!temporaryFile.renameTo(modelFile)) {
+
                         restorePreviousModel(oldModelMoved)
+
                         return@withLock false
                     }
 
                     newModelInstalled = true
 
                     if (!hasValidGgufHeader(modelFile)) {
+
                         modelFile.delete()
+
                         restorePreviousModel(oldModelMoved)
+
                         return@withLock false
                     }
 
-                    if (oldModelMoved && !backupFile.delete()) {
+                    if (
+                        oldModelMoved &&
+                        !backupFile.delete()
+                    ) {
+
                         modelFile.delete()
+
                         restorePreviousModel(true)
+
                         return@withLock false
                     }
 
-                    loadedModelPath = null
+                    ModelStorageCoordinator.loadedModelPath = null
+
                     true
 
                 } catch (_: Exception) {
+
                     if (temporaryFile.exists()) {
                         temporaryFile.delete()
                     }
 
-                    if (newModelInstalled && modelFile.exists()) {
+                    if (
+                        newModelInstalled &&
+                        modelFile.exists()
+                    ) {
                         modelFile.delete()
                     }
 
                     restorePreviousModel(oldModelMoved)
-                    loadedModelPath = null
+
+                    ModelStorageCoordinator.loadedModelPath = null
+
                     false
                 }
             }
         }
 
-    private fun restorePreviousModel(oldModelMoved: Boolean): Boolean {
+    // Must only be called while engineMutex is held.
+    private fun restorePreviousModel(
+        oldModelMoved: Boolean
+    ): Boolean {
+
         if (!oldModelMoved || !backupFile.exists()) {
             return !oldModelMoved
         }
 
-        if (modelFile.exists() && !modelFile.delete()) {
+        if (
+            modelFile.exists() &&
+            !modelFile.delete()
+        ) {
             return false
         }
 
