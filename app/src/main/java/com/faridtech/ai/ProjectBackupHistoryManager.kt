@@ -9,19 +9,6 @@ import java.io.File
 import java.security.MessageDigest
 import java.util.Date
 
-data class ProjectBackupEntry(
-    val backupId: String,
-    val projectPath: String,
-    val filePath: String,
-    val fileName: String,
-    val backupPath: String,
-    val createdAt: Long,
-    val originalHash: String,
-    val appliedHash: String,
-    val backupSize: Long,
-    val isHealthy: Boolean
-)
-
 class ProjectBackupHistoryManager(context: Context) {
 
     companion object {
@@ -110,20 +97,23 @@ class ProjectBackupHistoryManager(context: Context) {
 
             if (!manifestFile.isFile) return null
 
+            val canonicalManifest = manifestFile.canonicalFile
+            val canonicalBackupRoot = backupRoot.canonicalFile
+
             if (
-                !manifestFile.path.startsWith(
-                    backupRoot.path + File.separator
+                !canonicalManifest.path.startsWith(
+                    canonicalBackupRoot.path + File.separator
                 )
             ) {
                 return null
             }
 
-            if (manifestFile.length() > MAX_MANIFEST_SIZE) {
+            if (canonicalManifest.length() > MAX_MANIFEST_SIZE) {
                 return null
             }
 
             val manifest = JSONObject(
-                manifestFile.readText(Charsets.UTF_8)
+                canonicalManifest.readText(Charsets.UTF_8)
             )
 
             val savedProjectPath =
@@ -155,7 +145,7 @@ class ProjectBackupHistoryManager(context: Context) {
             }
 
             if (
-                backupId != manifestFile.nameWithoutExtension
+                backupId != canonicalManifest.nameWithoutExtension
             ) {
                 return null
             }
@@ -166,12 +156,12 @@ class ProjectBackupHistoryManager(context: Context) {
             ) ?: return null
 
             val backupFile = File(
-                backupRoot,
+                canonicalBackupRoot,
                 "$backupId.bak"
             ).canonicalFile
 
             val backupPrefix =
-                backupRoot.path + File.separator
+                canonicalBackupRoot.path + File.separator
 
             if (
                 !backupFile.path.startsWith(backupPrefix) ||
@@ -189,16 +179,14 @@ class ProjectBackupHistoryManager(context: Context) {
                 calculateHash(backupBytes) == originalHash
 
             ProjectBackupEntry(
-                backupId = backupId,
+                backupPath = backupFile.absolutePath,
                 projectPath = projectRoot.path,
                 filePath = target.path,
-                fileName = target.name,
-                backupPath = backupFile.absolutePath,
-                createdAt = createdAt,
                 originalHash = originalHash,
                 appliedHash = appliedHash,
+                createdAt = createdAt,
                 backupSize = backupBytes.size.toLong(),
-                isHealthy = healthy
+                isValid = healthy
             )
 
         } catch (_: Exception) {
@@ -231,10 +219,10 @@ class ProjectBackupHistoryManager(context: Context) {
                 val manifests = backupRoot.listFiles()
                     ?.filter {
                         it.isFile &&
-                        it.extension.equals(
-                            "json",
-                            ignoreCase = true
-                        )
+                            it.extension.equals(
+                                "json",
+                                ignoreCase = true
+                            )
                     }
                     ?: return@withContext emptyList()
 
@@ -304,10 +292,12 @@ class ProjectBackupHistoryManager(context: Context) {
     fun formatBackupSize(size: Long): String {
         return when {
             size < 1024 -> "$size B"
+
             size < 1024 * 1024 ->
                 "%.1f KB".format(
                     size / 1024.0
                 )
+
             else ->
                 "%.1f MB".format(
                     size / (1024.0 * 1024.0)
