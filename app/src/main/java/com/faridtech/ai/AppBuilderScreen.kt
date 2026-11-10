@@ -12,6 +12,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -19,6 +20,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+
+private data class ProjectTreeEntry(
+    val file: File,
+    val depth: Int
+)
 
 @Composable
 fun AppBuilderScreen(
@@ -28,15 +34,27 @@ fun AppBuilderScreen(
     val scope = rememberCoroutineScope()
 
     var projectName by remember { mutableStateOf("") }
-    var packageName by remember { mutableStateOf("com.example.myapp") }
+    var packageName by remember {
+        mutableStateOf("com.example.myapp")
+    }
     var language by remember { mutableStateOf("Kotlin") }
 
     var projectFolder by remember { mutableStateOf<File?>(null) }
+    var currentDirectory by remember { mutableStateOf<File?>(null) }
     var selectedFile by remember { mutableStateOf<File?>(null) }
-    var editorText by remember { mutableStateOf("") }
 
-    var files by remember { mutableStateOf<List<File>>(emptyList()) }
-    var newFileName by remember { mutableStateOf("") }
+    var editorText by remember { mutableStateOf("") }
+    var entries by remember {
+        mutableStateOf<List<ProjectTreeEntry>>(emptyList())
+    }
+
+    var newItemName by remember { mutableStateOf("") }
+    var newItemIsFolder by remember { mutableStateOf(false) }
+
+    var dialogTarget by remember { mutableStateOf<File?>(null) }
+    var renameValue by remember { mutableStateOf("") }
+    var showRenameDialog by remember { mutableStateOf(false) }
+    var showDeleteDialog by remember { mutableStateOf(false) }
 
     var error by remember { mutableStateOf("") }
     var message by remember { mutableStateOf("") }
@@ -46,11 +64,116 @@ fun AppBuilderScreen(
         "^[a-zA-Z][a-zA-Z0-9_]*(\\.[a-zA-Z][a-zA-Z0-9_]*)+$"
     )
 
-    fun refreshFiles(folder: File) {
-        files = folder.listFiles()
-            ?.filter { it.isFile }
-            ?.sortedBy { it.name }
-            ?: emptyList()
+    val editableExtensions = setOf(
+        "kt", "java", "xml", "gradle", "kts",
+        "properties", "txt", "md", "json",
+        "html", "css", "js", "cpp", "h",
+        "c", "cmake", "pro", "sql", "py"
+    )
+
+    fun isEditable(file: File): Boolean {
+        val extension = file.extension.lowercase()
+        return extension in editableExtensions
+    }
+
+    fun isInsideProject(file: File, root: File): Boolean {
+        return try {
+            val rootPath = root.canonicalFile.toPath()
+            val filePath = file.canonicalFile.toPath()
+            filePath.startsWith(rootPath) && filePath != rootPath
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    suspend fun scanProject(root: File): List<ProjectTreeEntry> {
+        return withContext(Dispatchers.IO) {
+            val result = mutableListOf<ProjectTreeEntry>()
+
+            fun scan(directory: File, depth: Int) {
+                val children = directory.listFiles()
+                    ?.filter { !it.name.startsWith(".") }
+                    ?.sortedWith(
+                        compareBy<File> { !it.isDirectory }
+                            .thenBy { it.name.lowercase() }
+                    )
+                    ?: return
+
+                children.forEach { child ->
+                    result.add(
+                        ProjectTreeEntry(
+                            file = child,
+                            depth = depth
+                        )
+                    )
+
+                    if (child.isDirectory) {
+                        scan(child, depth + 1)
+                    }
+                }
+            }
+
+            scan(root, 0)
+            result
+        }
+    }
+
+    fun refreshTree(root: File) {
+        scope.launch {
+            entries = scanProject(root)
+        }
+    }
+
+    fun openFile(file: File) {
+        val root = projectFolder ?: return
+
+        if (!isInsideProject(file, root)) {
+            error = "مسیر فایل معتبر نیست."
+            return
+        }
+
+        if (!file.isFile || !isEditable(file)) {
+            error = "این نوع فایل برای ویرایش متنی پشتیبانی نمی‌شود."
+            return
+        }
+
+        scope.launch {
+            try {
+                val content = withContext(Dispatchers.IO) {
+                    file.readText()
+                }
+
+                selectedFile = file
+                editorText = content
+                error = ""
+                message = ""
+            } catch (_: Exception) {
+                error = "خواندن فایل ناموفق بود."
+            }
+        }
+    }
+
+    fun saveFile() {
+        val file = selectedFile ?: return
+        val root = projectFolder ?: return
+
+        if (!isInsideProject(file, root)) {
+            error = "مسیر فایل معتبر نیست."
+            return
+        }
+
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    file.writeText(editorText)
+                }
+
+                message = "تغییرات فایل ذخیره شد."
+                error = ""
+            } catch (_: Exception) {
+                error = "ذخیره فایل ناموفق بود."
+            }
+        }
     }
 
     fun createProject() {
@@ -64,6 +187,14 @@ fun AppBuilderScreen(
             return
         }
 
+        val safeName = projectName.trim()
+            .replace(Regex("[^a-zA-Z0-9_-]"), "_")
+
+        if (safeName.isBlank()) {
+            error = "نام پروژه معتبر نیست."
+            return
+        }
+
         loading = true
         error = ""
         message = ""
@@ -71,18 +202,13 @@ fun AppBuilderScreen(
         scope.launch {
             try {
                 val folder = withContext(Dispatchers.IO) {
-                    val root = File(
-                        context.filesDir,
-                        "projects"
-                    )
+                    val root = File(context.filesDir, "projects")
 
-                    if (!root.exists()) {
-                        root.mkdirs()
+                    if (!root.exists() && !root.mkdirs()) {
+                        throw IllegalStateException(
+                            "ساخت پوشه پروژه‌ها ناموفق بود."
+                        )
                     }
-
-                    val safeName = projectName
-                        .trim()
-                        .replace(Regex("[^a-zA-Z0-9_-]"), "_")
 
                     val project = File(root, safeName)
 
@@ -105,16 +231,16 @@ fun AppBuilderScreen(
 
                     val javaFolder = File(
                         sourceFolder,
-                        "java/" + packageName.replace(".", "/")
+                        "java/${packageName.replace(".", "/")}"
                     )
 
-                    val resFolder = File(
-                        sourceFolder,
-                        "res"
-                    )
+                    val resFolder = File(sourceFolder, "res")
 
-                    javaFolder.mkdirs()
-                    resFolder.mkdirs()
+                    if (!javaFolder.mkdirs() || !resFolder.mkdirs()) {
+                        throw IllegalStateException(
+                            "ساخت ساختار اولیه پروژه ناموفق بود."
+                        )
+                    }
 
                     val activityFile = File(
                         javaFolder,
@@ -184,7 +310,7 @@ public class MainActivity extends Activity {
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <application
-        android:label="$projectName"
+        android:label="$safeName"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
         <activity
@@ -271,21 +397,11 @@ android.useAndroidX=true
                 }
 
                 projectFolder = folder
-                refreshFiles(folder)
-
-                val mainFile = files.firstOrNull {
-                    it.name == if (language == "Kotlin") {
-                        "MainActivity.kt"
-                    } else {
-                        "MainActivity.java"
-                    }
-                }
-
-                selectedFile = mainFile
-
-                editorText = mainFile?.readText() ?: ""
-
-                message = "پروژه با موفقیت ایجاد شد."
+                currentDirectory = folder
+                selectedFile = null
+                editorText = ""
+                entries = scanProject(folder)
+                message = "پروژه و ساختار اولیه آن ایجاد شد."
             } catch (e: Exception) {
                 error = e.message ?: "خطا در ساخت پروژه."
             } finally {
@@ -294,86 +410,168 @@ android.useAndroidX=true
         }
     }
 
-    fun openFile(file: File) {
-        scope.launch {
-            try {
-                val content = withContext(Dispatchers.IO) {
-                    file.readText()
-                }
+    fun createItem() {
+        val root = projectFolder ?: return
+        val parent = currentDirectory ?: root
+        val name = newItemName.trim()
 
-                selectedFile = file
-                editorText = content
-                error = ""
-                message = ""
-            } catch (e: Exception) {
-                error = "خواندن فایل ناموفق بود."
-            }
-        }
-    }
-
-    fun saveFile() {
-        val file = selectedFile ?: return
-
-        scope.launch {
-            try {
-                withContext(Dispatchers.IO) {
-                    file.writeText(editorText)
-                }
-
-                message = "تغییرات فایل ذخیره شد."
-                error = ""
-            } catch (e: Exception) {
-                error = "ذخیره فایل ناموفق بود."
-            }
-        }
-    }
-
-    fun createNewFile() {
-        val folder = projectFolder ?: return
-
-        val name = newFileName.trim()
-
-        if (name.isBlank()) {
-            error = "نام فایل را وارد کنید."
+        if (!isInsideProject(parent, root) && parent != root) {
+            error = "مسیر پوشه معتبر نیست."
             return
         }
 
         if (
+            name.isBlank() ||
             name.contains("/") ||
             name.contains("\\") ||
-            name.contains("..") ||
-            name.startsWith(".")
+            name == "." ||
+            name == ".." ||
+            name.startsWith(".") ||
+            !name.matches(Regex("[a-zA-Z0-9_.-]+"))
         ) {
-            error = "نام فایل معتبر نیست."
+            error = "نام فایل یا پوشه معتبر نیست."
             return
         }
 
-        if (!name.matches(Regex("[a-zA-Z0-9_.-]+"))) {
-            error = "فقط حروف انگلیسی، عدد، نقطه و خط تیره مجاز است."
-            return
-        }
+        val target = File(parent, name)
 
-        val file = File(folder, name)
-
-        if (file.exists()) {
-            error = "این فایل از قبل وجود دارد."
+        if (target.exists()) {
+            error = "این نام از قبل وجود دارد."
             return
         }
 
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    file.writeText("")
+                    val success = if (newItemIsFolder) {
+                        target.mkdirs()
+                    } else {
+                        target.createNewFile()
+                    }
+
+                    if (!success) {
+                        throw IllegalStateException(
+                            "ساخت فایل یا پوشه ناموفق بود."
+                        )
+                    }
                 }
 
-                refreshFiles(folder)
-                selectedFile = file
+                newItemName = ""
+                entries = scanProject(root)
+                message = if (newItemIsFolder) {
+                    "پوشه جدید ساخته شد."
+                } else {
+                    "فایل جدید ساخته شد."
+                }
+                error = ""
+
+                if (!newItemIsFolder && isEditable(target)) {
+                    selectedFile = target
+                    editorText = ""
+                }
+            } catch (e: Exception) {
+                error = e.message ?: "عملیات ناموفق بود."
+            }
+        }
+    }
+
+    fun renameItem() {
+        val root = projectFolder ?: return
+        val target = dialogTarget ?: return
+        val newName = renameValue.trim()
+
+        if (!isInsideProject(target, root)) {
+            error = "مسیر موردنظر معتبر نیست."
+            showRenameDialog = false
+            return
+        }
+
+        if (
+            newName.isBlank() ||
+            newName.contains("/") ||
+            newName.contains("\\") ||
+            newName == "." ||
+            newName == ".." ||
+            newName.startsWith(".") ||
+            !newName.matches(Regex("[a-zA-Z0-9_.-]+"))
+        ) {
+            error = "نام جدید معتبر نیست."
+            return
+        }
+
+        val destination = File(target.parentFile, newName)
+
+        if (destination.exists()) {
+            error = "فایل یا پوشه‌ای با این نام وجود دارد."
+            return
+        }
+
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    if (!target.renameTo(destination)) {
+                        throw IllegalStateException(
+                            "تغییر نام انجام نشد."
+                        )
+                    }
+                }
+
+                selectedFile = null
                 editorText = ""
-                newFileName = ""
-                message = "فایل جدید ساخته شد."
+                currentDirectory = currentDirectory?.let {
+                    if (it == target) destination else it
+                }
+
+                entries = scanProject(root)
+                showRenameDialog = false
+                dialogTarget = null
+                message = "تغییر نام با موفقیت انجام شد."
                 error = ""
             } catch (e: Exception) {
-                error = "ساخت فایل ناموفق بود."
+                error = e.message ?: "تغییر نام ناموفق بود."
+            }
+        }
+    }
+
+    fun deleteItem() {
+        val root = projectFolder ?: return
+        val target = dialogTarget ?: return
+
+        if (!isInsideProject(target, root)) {
+            error = "حذف این مسیر مجاز نیست."
+            showDeleteDialog = false
+            return
+        }
+
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    if (!target.deleteRecursively()) {
+                        throw IllegalStateException(
+                            "حذف فایل یا پوشه ناموفق بود."
+                        )
+                    }
+                }
+
+                selectedFile = null
+                editorText = ""
+
+                if (
+                    currentDirectory != null &&
+                    (currentDirectory == target ||
+                        currentDirectory!!.toPath()
+                            .startsWith(target.toPath()))
+                ) {
+                    currentDirectory = root
+                }
+
+                entries = scanProject(root)
+                showDeleteDialog = false
+                dialogTarget = null
+                message = "حذف با موفقیت انجام شد."
+                error = ""
+            } catch (e: Exception) {
+                error = e.message ?: "حذف انجام نشد."
             }
         }
     }
@@ -397,12 +595,11 @@ android.useAndroidX=true
         )
 
         Text(
-            "محیط ایجاد و مدیریت پروژه‌های اندروید",
+            "ایجاد پروژه و مدیریت فایل‌های اندروید",
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
 
         if (projectFolder == null) {
-
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(22.dp)
@@ -419,9 +616,7 @@ android.useAndroidX=true
 
                     OutlinedTextField(
                         value = projectName,
-                        onValueChange = {
-                            projectName = it
-                        },
+                        onValueChange = { projectName = it },
                         modifier = Modifier.fillMaxWidth(),
                         label = { Text("نام پروژه") },
                         placeholder = { Text("MyFirstApp") },
@@ -430,14 +625,10 @@ android.useAndroidX=true
 
                     OutlinedTextField(
                         value = packageName,
-                        onValueChange = {
-                            packageName = it
-                        },
+                        onValueChange = { packageName = it },
                         modifier = Modifier.fillMaxWidth(),
                         label = { Text("شناسه بسته") },
-                        placeholder = {
-                            Text("com.example.myapp")
-                        },
+                        placeholder = { Text("com.example.myapp") },
                         singleLine = true
                     )
 
@@ -451,17 +642,13 @@ android.useAndroidX=true
                     ) {
                         FilterChip(
                             selected = language == "Kotlin",
-                            onClick = {
-                                language = "Kotlin"
-                            },
+                            onClick = { language = "Kotlin" },
                             label = { Text("Kotlin") }
                         )
 
                         FilterChip(
                             selected = language == "Java",
-                            onClick = {
-                                language = "Java"
-                            },
+                            onClick = { language = "Java" },
                             label = { Text("Java") }
                         )
                     }
@@ -491,8 +678,8 @@ android.useAndroidX=true
                     }
                 }
             }
-
         } else {
+            val root = projectFolder!!
 
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -519,16 +706,17 @@ android.useAndroidX=true
                     )
 
                     Text(
-                        "مسیر ذخیره: فضای داخلی برنامه",
+                        "فضای ذخیره‌سازی داخلی برنامه",
                         style = MaterialTheme.typography.bodySmall
                     )
 
                     OutlinedButton(
                         onClick = {
                             projectFolder = null
+                            currentDirectory = null
                             selectedFile = null
+                            entries = emptyList()
                             editorText = ""
-                            files = emptyList()
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
@@ -538,69 +726,203 @@ android.useAndroidX=true
             }
 
             Text(
-                "فایل‌های پروژه",
+                "ساختار پروژه",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold
             )
 
-            files.forEach { file ->
-                Card(
-                    onClick = { openFile(file) },
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(13.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = if (selectedFile == file) {
-                            MaterialTheme.colorScheme.primaryContainer
-                        } else {
-                            MaterialTheme.colorScheme.surface
-                        }
-                    )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = {
+                        currentDirectory = root
+                        selectedFile = null
+                        editorText = ""
+                    },
+                    modifier = Modifier.weight(1f)
                 ) {
-                    Row(
-                        modifier = Modifier.padding(14.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("📄")
-                        Spacer(Modifier.width(10.dp))
-                        Text(
-                            file.name,
-                            modifier = Modifier.weight(1f),
-                            fontWeight = FontWeight.Medium
-                        )
-                        Text("›")
-                    }
+                    Text("📁 ریشه پروژه")
+                }
+
+                OutlinedButton(
+                    onClick = {
+                        val parent = currentDirectory?.parentFile
+                        if (parent != null && parent == root ||
+                            parent != null && isInsideProject(parent, root)
+                        ) {
+                            currentDirectory = parent
+                            selectedFile = null
+                            editorText = ""
+                        }
+                    },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("↑ پوشه بالاتر")
                 }
             }
 
-            OutlinedTextField(
-                value = newFileName,
-                onValueChange = { newFileName = it },
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("نام فایل جدید") },
-                placeholder = { Text("MyFile.kt") },
-                singleLine = true
+            Text(
+                "مسیر فعلی: " +
+                    (currentDirectory?.relativeToOrNull(root)?.path ?: "ریشه پروژه"),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall
             )
 
-            OutlinedButton(
-                onClick = { createNewFile() },
-                modifier = Modifier.fillMaxWidth()
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(18.dp)
             ) {
-                Text("＋ ساخت فایل جدید")
+                Column(
+                    modifier = Modifier.padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    entries.forEach { entry ->
+                        val file = entry.file
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(
+                                    if (selectedFile == file) {
+                                        MaterialTheme.colorScheme.primaryContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.surface
+                                    },
+                                    RoundedCornerShape(10.dp)
+                                )
+                                .padding(
+                                    start = (8 + entry.depth * 12).dp,
+                                    end = 6.dp,
+                                    top = 5.dp,
+                                    bottom = 5.dp
+                                ),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TextButton(
+                                onClick = {
+                                    if (file.isDirectory) {
+                                        currentDirectory = file
+                                        selectedFile = null
+                                        editorText = ""
+                                    } else {
+                                        openFile(file)
+                                    }
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(
+                                    (if (file.isDirectory) "📁 " else "📄 ") +
+                                        file.name,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+
+                            TextButton(
+                                onClick = {
+                                    dialogTarget = file
+                                    renameValue = file.name
+                                    showRenameDialog = true
+                                    error = ""
+                                }
+                            ) {
+                                Text("تغییر نام")
+                            }
+
+                            TextButton(
+                                onClick = {
+                                    dialogTarget = file
+                                    showDeleteDialog = true
+                                    error = ""
+                                }
+                            ) {
+                                Text(
+                                    "حذف",
+                                    color = MaterialTheme.colorScheme.error
+                                )
+                            }
+                        }
+                    }
+
+                    if (entries.isEmpty()) {
+                        Text(
+                            "این پروژه هنوز فایلی ندارد.",
+                            modifier = Modifier.padding(12.dp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
             }
 
             HorizontalDivider()
 
             Text(
-                selectedFile?.name ?: "فایلی انتخاب نشده",
+                "ایجاد فایل یا پوشه",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold
+            )
+
+            OutlinedTextField(
+                value = newItemName,
+                onValueChange = { newItemName = it },
+                modifier = Modifier.fillMaxWidth(),
+                label = {
+                    Text(
+                        if (newItemIsFolder) {
+                            "نام پوشه جدید"
+                        } else {
+                            "نام فایل جدید"
+                        }
+                    )
+                },
+                placeholder = {
+                    Text(
+                        if (newItemIsFolder) {
+                            "utils"
+                        } else {
+                            "MyFile.kt"
+                        }
+                    )
+                },
+                singleLine = true
+            )
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                FilterChip(
+                    selected = !newItemIsFolder,
+                    onClick = { newItemIsFolder = false },
+                    label = { Text("📄 فایل") }
+                )
+
+                FilterChip(
+                    selected = newItemIsFolder,
+                    onClick = { newItemIsFolder = true },
+                    label = { Text("📁 پوشه") }
+                )
+            }
+
+            Button(
+                onClick = { createItem() },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("＋ ایجاد")
+            }
+
+            HorizontalDivider()
+
+            Text(
+                selectedFile?.name ?: "ویرایشگر کد",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold
             )
 
             OutlinedTextField(
                 value = editorText,
-                onValueChange = {
-                    editorText = it
-                },
+                onValueChange = { editorText = it },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(330.dp),
@@ -608,7 +930,7 @@ android.useAndroidX=true
                     Text("کد برنامه را اینجا وارد کنید...")
                 },
                 textStyle = MaterialTheme.typography.bodySmall.copy(
-                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
+                    fontFamily = FontFamily.Monospace
                 )
             )
 
@@ -633,12 +955,12 @@ android.useAndroidX=true
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Text(
-                        "مرحله آماده‌سازی APK",
+                        "مرحله ساخت APK",
                         fontWeight = FontWeight.Bold
                     )
 
                     Text(
-                        "ساخت واقعی APK هنوز فعال نیست. ابتدا مدیریت پروژه و فایل‌ها را تکمیل می‌کنیم؛ سپس ابزار ساخت و خروجی APK را به این محیط متصل خواهیم کرد.",
+                        "مدیریت فایل‌ها در این مرحله فراهم شده است. اجرای Gradle و تولید APK هنوز به ابزار ساخت اندروید متصل نشده است.",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
@@ -653,11 +975,85 @@ android.useAndroidX=true
             )
         }
 
-        if (error.isNotEmpty() && projectFolder != null) {
+        if (error.isNotEmpty()) {
             Text(
                 error,
                 color = MaterialTheme.colorScheme.error
             )
         }
+    }
+
+    if (showRenameDialog && dialogTarget != null) {
+        AlertDialog(
+            onDismissRequest = {
+                showRenameDialog = false
+                dialogTarget = null
+            },
+            title = { Text("تغییر نام") },
+            text = {
+                OutlinedTextField(
+                    value = renameValue,
+                    onValueChange = { renameValue = it },
+                    label = { Text("نام جدید") },
+                    singleLine = true
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { renameItem() }) {
+                    Text("ذخیره")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showRenameDialog = false
+                        dialogTarget = null
+                    }
+                ) {
+                    Text("انصراف")
+                }
+            }
+        )
+    }
+
+    if (showDeleteDialog && dialogTarget != null) {
+        AlertDialog(
+            onDismissRequest = {
+                showDeleteDialog = false
+                dialogTarget = null
+            },
+            title = { Text("تأیید حذف") },
+            text = {
+                Text(
+                    "آیا از حذف «${dialogTarget?.name}» مطمئن هستید؟ اگر پوشه باشد، تمام محتویات آن نیز حذف می‌شود."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { deleteItem() }) {
+                    Text(
+                        "حذف",
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showDeleteDialog = false
+                        dialogTarget = null
+                    }
+                ) {
+                    Text("انصراف")
+                }
+            }
+        )
+    }
+}
+
+private fun File.relativeToOrNull(base: File): File? {
+    return try {
+        relativeTo(base)
+    } catch (_: Exception) {
+        null
     }
 }
