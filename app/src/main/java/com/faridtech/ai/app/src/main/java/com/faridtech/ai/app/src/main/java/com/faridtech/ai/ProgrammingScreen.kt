@@ -328,6 +328,28 @@ fun ProgrammingScreen(
         recoveryInProgress
 
     // -------------------------------------------------
+    // قفل کردن پروژه در صورت باقی ماندن عملیات بازیابی
+    // -------------------------------------------------
+
+    fun lockProjectForRecovery(reason: String) {
+        recoveryReady = false
+        recoveryError =
+            "وضعیت عملیات فایل نیازمند بررسی مجدد است. تا پایان بازیابی، عملیات پروژه غیرفعال خواهد بود."
+
+        recoveryMessages.clear()
+
+        recoveryMessages.add(
+            reason.ifBlank {
+                "یک عملیات فایل نیازمند بررسی مجدد است."
+            }
+        )
+
+        recoveryMessages.add(
+            "برای بررسی مجدد وضعیت فایل‌ها، دکمه «تلاش مجدد برای بازیابی» را انتخاب کنید."
+        )
+    }
+
+    // -------------------------------------------------
     // بازیابی و بارگذاری امن پروژه
     // -------------------------------------------------
 
@@ -361,7 +383,6 @@ fun ProgrammingScreen(
 
             recoveryMessages.addAll(messages)
 
-            // قفل فقط پس از موفقیت واقعی بازیابی باز می‌شود.
             recoverySucceeded = true
             recoveryReady = true
 
@@ -388,7 +409,6 @@ fun ProgrammingScreen(
             throw e
 
         } catch (e: ProjectRecoveryException) {
-            // خطای مخصوص بازیابی امن
             recoveryReady = false
             recoverySucceeded = false
 
@@ -818,6 +838,7 @@ fun ProgrammingScreen(
                 )
 
                 when (changeResult) {
+
                     is ProjectFileChangeResult.Applied -> {
                         code = preview.proposedContent
 
@@ -836,8 +857,37 @@ fun ProgrammingScreen(
                         refreshBackupHistory(force = true)
                     }
 
+                    is ProjectFileChangeResult.AppliedWithPendingRecovery -> {
+                        // فایل واقعاً تغییر کرده است.
+                        code = preview.proposedContent
+
+                        lastBackupPath = changeResult.backupPath
+                        undoTargetFile = File(preview.filePath)
+
+                        result =
+                            "اصلاح فایل اعمال و تأیید شد؛ اما ثبت نهایی عملیات بازیابی کامل نشده است."
+
+                        pendingChange = null
+                        showChangeReview = false
+
+                        lockProjectForRecovery(
+                            changeResult.reason
+                        )
+                    }
+
                     is ProjectFileChangeResult.Rejected -> {
                         errorMessage = changeResult.reason
+                    }
+
+                    is ProjectFileChangeResult.RejectedWithPendingRecovery -> {
+                        errorMessage = changeResult.reason
+
+                        pendingChange = null
+                        showChangeReview = false
+
+                        lockProjectForRecovery(
+                            changeResult.reason
+                        )
                     }
                 }
 
@@ -884,6 +934,7 @@ fun ProgrammingScreen(
                 )
 
                 when (restoreResult) {
+
                     is ProjectFileRestoreResult.Restored -> {
                         val restoredContent =
                             withContext(Dispatchers.IO) {
@@ -916,9 +967,49 @@ fun ProgrammingScreen(
                         refreshBackupHistory(force = true)
                     }
 
+                    is ProjectFileRestoreResult.RestoredWithPendingRecovery -> {
+                        val restoredContent =
+                            withContext(Dispatchers.IO) {
+                                if (!isSafeProjectFile(root, target)) {
+                                    throw SecurityException(
+                                        "فایل بازگردانی‌شده در مسیر مجاز قرار ندارد."
+                                    )
+                                }
+
+                                target.readText(Charsets.UTF_8)
+                            }
+
+                        if (
+                            selectedProjectFile?.canonicalPath ==
+                            target.canonicalPath
+                        ) {
+                            code = restoredContent
+                        }
+
+                        result =
+                            "فایل بازگردانی شد، اما پاک‌سازی Journal کامل نشده است."
+
+                        lastBackupPath = null
+                        undoTargetFile = null
+                        showRestoreConfirmation = false
+
+                        lockProjectForRecovery(
+                            restoreResult.reason
+                        )
+                    }
+
                     is ProjectFileRestoreResult.Rejected -> {
                         errorMessage = restoreResult.reason
                         showRestoreConfirmation = false
+                    }
+
+                    is ProjectFileRestoreResult.RejectedWithPendingRecovery -> {
+                        errorMessage = restoreResult.reason
+                        showRestoreConfirmation = false
+
+                        lockProjectForRecovery(
+                            restoreResult.reason
+                        )
                     }
                 }
 
@@ -1023,8 +1114,53 @@ fun ProgrammingScreen(
                         backupHistory.addAll(updatedHistory)
                     }
 
+                    is ProjectFileRestoreResult.RestoredWithPendingRecovery -> {
+
+                        val restoredContent =
+                            withContext(Dispatchers.IO) {
+
+                                if (!isSafeProjectFile(root, target)) {
+                                    throw SecurityException(
+                                        "فایل بازگردانی‌شده در مسیر مجاز قرار ندارد."
+                                    )
+                                }
+
+                                target.readText(Charsets.UTF_8)
+                            }
+
+                        val selectedFileMatches = try {
+                            selectedProjectFile?.canonicalPath ==
+                                target.canonicalPath
+                        } catch (_: Exception) {
+                            false
+                        }
+
+                        if (selectedFileMatches) {
+                            code = restoredContent
+                        }
+
+                        lastBackupPath = null
+                        undoTargetFile = null
+                        showRestoreConfirmation = false
+
+                        result =
+                            "نسخه تاریخی بازگردانی شد، اما پاک‌سازی Journal کامل نشده است."
+
+                        lockProjectForRecovery(
+                            restoreResult.reason
+                        )
+                    }
+
                     is ProjectFileRestoreResult.Rejected -> {
                         errorMessage = restoreResult.reason
+                    }
+
+                    is ProjectFileRestoreResult.RejectedWithPendingRecovery -> {
+                        errorMessage = restoreResult.reason
+
+                        lockProjectForRecovery(
+                            restoreResult.reason
+                        )
                     }
                 }
 
