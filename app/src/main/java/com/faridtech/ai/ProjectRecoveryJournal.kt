@@ -2,1735 +2,468 @@
 package com.faridtech.ai
 
 import android.content.Context
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import android.util.AtomicFile
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.File
+import java.io.IOException
+import java.security.MessageDigest
+import java.util.UUID
 
-private val ProgrammingGreen = Color(0xFF19C37D)
-
-private val programmingLanguages = listOf(
-    "Kotlin", "Java", "Python", "C++", "C",
-    "HTML", "CSS", "JavaScript", "PHP",
-    "SQL", "Dart", "Swift"
-)
-
-private val programmingTasks = listOf(
-    "تولید کد",
-    "اصلاح کد",
-    "رفع خطا",
-    "توضیح کد"
-)
-
-private val allowedProjectExtensions = setOf(
-    "kt", "java", "xml", "gradle", "kts",
-    "txt", "md", "json", "html", "css",
-    "js", "cpp", "h", "c", "cmake",
-    "pro", "sql", "py", "dart", "swift"
-)
-
-private val blockedProjectNames = setOf(
-    ".env",
-    ".env.local",
-    "local.properties",
-    "gradle.properties",
-    "key.properties"
-)
-
-private const val AI_CODE_START = "<<<FARID_CODE_START>>>"
-private const val AI_CODE_END = "<<<FARID_CODE_END>>>"
-
-private fun isSafeProjectFile(
-    projectRoot: File,
-    file: File
-): Boolean {
-    return try {
-        val root = projectRoot.canonicalFile
-        val target = file.canonicalFile
-        val rootPath = root.path + File.separator
-
-        if (!target.path.startsWith(rootPath)) return false
-        if (!target.isFile || !target.canRead()) return false
-        if (target.length() > 256 * 1024) return false
-
-        val name = target.name.lowercase()
-
-        if (name in blockedProjectNames) return false
-
-        if (
-            name.endsWith(".keystore") ||
-            name.endsWith(".jks") ||
-            name.endsWith(".pem") ||
-            name.endsWith(".p12") ||
-            name.endsWith(".pfx")
-        ) return false
-
-        target.extension.lowercase() in allowedProjectExtensions
-    } catch (_: Exception) {
-        false
-    }
+internal enum class RecoveryOperationType {
+    APPLY_CHANGE,
+    RESTORE_HISTORICAL,
+    RESTORE_BACKUP
 }
 
-private suspend fun scanSafeProjectFiles(
-    context: Context,
-    project: File
-): List<File> = withContext(Dispatchers.IO) {
-
-    val projectsDirectory = File(
-        context.filesDir,
-        "projects"
-    ).canonicalFile
-
-    val projectRoot = project.canonicalFile
-    val projectsPath = projectsDirectory.path + File.separator
-
-    if (
-        !projectRoot.isDirectory ||
-        !projectRoot.path.startsWith(projectsPath)
-    ) {
-        return@withContext emptyList()
-    }
-
-    val result = mutableListOf<File>()
-
-    projectRoot.walkTopDown()
-        .onEnter { directory ->
-            if (directory == projectRoot) {
-                true
-            } else {
-                val name = directory.name.lowercase()
-
-                !name.startsWith(".") &&
-                    name != "build" &&
-                    name != ".gradle" &&
-                    name != ".idea" &&
-                    name != "node_modules"
-            }
-        }
-        .forEach { file ->
-            if (
-                result.size < 200 &&
-                file.isFile &&
-                isSafeProjectFile(projectRoot, file)
-            ) {
-                result.add(file)
-            }
-        }
-
-    result.sortedBy {
-        it.relativeTo(projectRoot).path
-    }
+internal enum class RecoveryOperationState {
+    PREPARED,
+    COMMITTED
 }
 
-private fun extractProposedCode(response: String): String? {
-    val start = response.indexOf(AI_CODE_START)
-    val end = response.indexOf(AI_CODE_END)
+internal data class RecoveryJournalEntry(
+    val id: String,
+    val projectPath: String,
+    val filePath: String,
+    val backupPath: String,
+    val beforeHash: String,
+    val targetHash: String,
+    val operationType: RecoveryOperationType,
+    val state: RecoveryOperationState,
+    val createdAt: Long
+)
 
-    if (start < 0 || end <= start) return null
+internal sealed class RecoveryCheckResult {
+    data class Resolved(
+        val operationId: String,
+        val message: String
+    ) : RecoveryCheckResult()
 
-    var content = response.substring(
-        start + AI_CODE_START.length,
-        end
-    ).trim()
+    data class Pending(
+        val operationId: String,
+        val message: String
+    ) : RecoveryCheckResult()
 
-    if (content.startsWith("```")) {
-        val firstNewLine = content.indexOf('\n')
-        if (firstNewLine >= 0) {
-            content = content.substring(firstNewLine + 1)
-        }
-    }
-
-    if (content.endsWith("```")) {
-        content = content.dropLast(3).trimEnd()
-    }
-
-    return content.takeIf { it.isNotBlank() }
+    data class Invalid(
+        val operationId: String,
+        val message: String
+    ) : RecoveryCheckResult()
 }
 
-@Composable
-fun ProgrammingScreen(
-    context: Context,
-    onBack: () -> Unit,
-    project: File? = null
-) {
-    val engine = remember(context) {
-        LocalAIEngine(context.applicationContext)
+internal class ProjectRecoveryJournal(context: Context) {
+
+    companion object {
+        private const val JOURNAL_VERSION = 1
+        private const val MAX_JOURNAL_SIZE = 16 * 1024
+        private const val MAX_TARGET_FILE_SIZE = 256 * 1024
+
+        private const val JOURNAL_DIRECTORY = "project_recovery"
+
+        private val HASH_REGEX = Regex("^[a-fA-F0-9]{64}$")
     }
 
-    val changeManager = remember(context) {
-        ProjectFileChangeManager(context.applicationContext)
-    }
+    private val appContext = context.applicationContext
 
-    val scope = rememberCoroutineScope()
+    private val journalDirectory =
+        File(appContext.filesDir, JOURNAL_DIRECTORY)
 
-    val projectRoot = remember(project) {
-        project?.absoluteFile
-    }
-
-    var selectedLanguage by remember {
-        mutableStateOf("Kotlin")
-    }
-
-    var selectedTask by remember {
-        mutableStateOf("تولید کد")
-    }
-
-    var prompt by remember {
-        mutableStateOf("")
-    }
-
-    var code by remember {
-        mutableStateOf("")
-    }
-
-    var languageMenuExpanded by remember {
-        mutableStateOf(false)
-    }
-
-    var errorMessage by remember {
-        mutableStateOf("")
-    }
-
-    var result by remember {
-        mutableStateOf("")
-    }
-
-    var generating by remember {
-        mutableStateOf(false)
-    }
-
-    var checkingModel by remember {
-        mutableStateOf(true)
-    }
-
-    var modelAvailable by remember {
-        mutableStateOf(false)
-    }
-
-    val projectFiles = remember {
-        mutableStateListOf<File>()
-    }
-
-    var selectedProjectFile by remember {
-        mutableStateOf<File?>(null)
-    }
-
-    var showProjectFiles by remember {
-        mutableStateOf(false)
-    }
-
-    var loadingProjectFiles by remember {
-        mutableStateOf(false)
-    }
-
-    var loadingFile by remember {
-        mutableStateOf(false)
-    }
-
-    var projectError by remember {
-        mutableStateOf("")
-    }
-
-    var pendingChange by remember {
-        mutableStateOf<ProjectFileChangePreview?>(null)
-    }
-
-    var originalPreviewContent by remember {
-        mutableStateOf("")
-    }
-
-    var showChangeReview by remember {
-        mutableStateOf(false)
-    }
-
-    var applyingChange by remember {
-        mutableStateOf(false)
-    }
-
-    // آخرین نسخه پشتیبان
-    var lastBackupPath by remember {
-        mutableStateOf<String?>(null)
-    }
-
-    var undoTargetFile by remember {
-        mutableStateOf<File?>(null)
-    }
-
-    var showRestoreConfirmation by remember {
-        mutableStateOf(false)
-    }
-
-    var restoringBackup by remember {
-        mutableStateOf(false)
-    }
-
-    // تاریخچه نسخه‌های پشتیبان
-    val backupHistory = remember {
-        mutableStateListOf<ProjectBackupEntry>()
-    }
-
-    var showBackupHistory by remember {
-        mutableStateOf(false)
-    }
-
-    var loadingBackupHistory by remember {
-        mutableStateOf(false)
-    }
-
-    var backupHistoryError by remember {
-        mutableStateOf("")
-    }
-
-    // -------------------------------------------------
-    // وضعیت بازیابی عملیات نیمه‌تمام
-    // -------------------------------------------------
-
-    var recoveryFinished by remember(projectRoot) {
-        mutableStateOf(projectRoot == null)
-    }
-
-    val recoveryMessages = remember(projectRoot) {
-        mutableStateListOf<String>()
-    }
-
-    val recoveryInProgress =
-        projectRoot != null && !recoveryFinished
-
-    val busy = generating ||
-        applyingChange ||
-        restoringBackup ||
-        loadingFile ||
-        recoveryInProgress
-
-    // -------------------------------------------------
-    // تازه‌سازی تاریخچه
-    // -------------------------------------------------
-
-    fun refreshBackupHistory() {
-        val root = projectRoot ?: return
-
-        if (recoveryInProgress || restoringBackup) return
-
-        scope.launch {
-            loadingBackupHistory = true
-            backupHistoryError = ""
-
-            try {
-                val entries = withContext(Dispatchers.IO) {
-                    changeManager.getProjectHistory(root)
-                }
-
-                backupHistory.clear()
-                backupHistory.addAll(entries)
-
-            } catch (e: Exception) {
-                backupHistoryError =
-                    e.message ?: "بارگذاری تاریخچه ناموفق بود."
-            } finally {
-                loadingBackupHistory = false
-            }
+    private fun journalFile(id: String): File? {
+        if (id.isBlank() || !id.matches(Regex("^[a-fA-F0-9-]{36}$"))) {
+            return null
         }
-    }
 
-    // -------------------------------------------------
-    // بررسی مدل هوش مصنوعی
-    // -------------------------------------------------
+        val file = File(journalDirectory, "$id.json")
 
-    LaunchedEffect(engine) {
-        checkingModel = true
+        return try {
+            val root = journalDirectory.canonicalFile
+            val target = file.canonicalFile
 
-        try {
-            modelAvailable = engine.checkModel()
+            if (target.parentFile == root) target else null
         } catch (_: Exception) {
-            modelAvailable = false
+            null
         }
-
-        checkingModel = false
     }
 
-    // -------------------------------------------------
-    // بازیابی و بارگذاری اطلاعات پروژه
-    // -------------------------------------------------
+    private fun isValidHash(hash: String): Boolean {
+        return HASH_REGEX.matches(hash)
+    }
 
-    LaunchedEffect(projectRoot) {
+    private fun isValidEntry(entry: RecoveryJournalEntry): Boolean {
+        if (entry.id.isBlank()) return false
+        if (!entry.id.matches(Regex("^[a-fA-F0-9-]{36}$"))) return false
 
-        projectFiles.clear()
-        selectedProjectFile = null
-        pendingChange = null
-        showChangeReview = false
-        projectError = ""
+        if (entry.projectPath.isBlank()) return false
+        if (entry.filePath.isBlank()) return false
+        if (entry.backupPath.isBlank()) return false
 
-        lastBackupPath = null
-        undoTargetFile = null
+        if (!isValidHash(entry.beforeHash)) return false
+        if (!isValidHash(entry.targetHash)) return false
 
-        backupHistory.clear()
-        backupHistoryError = ""
+        if (entry.createdAt <= 0L) return false
 
-        recoveryMessages.clear()
+        return true
+    }
 
-        val currentProject = projectRoot
-            ?: return@LaunchedEffect
+    private fun serialize(entry: RecoveryJournalEntry): ByteArray {
+        val json = JSONObject().apply {
+            put("version", JOURNAL_VERSION)
+            put("id", entry.id)
+            put("projectPath", entry.projectPath)
+            put("filePath", entry.filePath)
+            put("backupPath", entry.backupPath)
+            put("beforeHash", entry.beforeHash)
+            put("targetHash", entry.targetHash)
+            put("operationType", entry.operationType.name)
+            put("state", entry.state.name)
+            put("createdAt", entry.createdAt)
+        }
 
-        recoveryFinished = false
-        loadingProjectFiles = true
-        loadingBackupHistory = true
+        return json.toString().toByteArray(Charsets.UTF_8)
+    }
+
+    private fun deserialize(bytes: ByteArray): RecoveryJournalEntry? {
+        if (bytes.isEmpty() || bytes.size > MAX_JOURNAL_SIZE) {
+            return null
+        }
+
+        return try {
+            val json = JSONObject(bytes.toString(Charsets.UTF_8))
+
+            if (json.optInt("version", -1) != JOURNAL_VERSION) {
+                return null
+            }
+
+            val operationType = runCatching {
+                RecoveryOperationType.valueOf(
+                    json.getString("operationType")
+                )
+            }.getOrNull() ?: return null
+
+            val state = runCatching {
+                RecoveryOperationState.valueOf(
+                    json.getString("state")
+                )
+            }.getOrNull() ?: return null
+
+            RecoveryJournalEntry(
+                id = json.getString("id"),
+                projectPath = json.getString("projectPath"),
+                filePath = json.getString("filePath"),
+                backupPath = json.getString("backupPath"),
+                beforeHash = json.getString("beforeHash"),
+                targetHash = json.getString("targetHash"),
+                operationType = operationType,
+                state = state,
+                createdAt = json.getLong("createdAt")
+            ).takeIf(::isValidEntry)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun readEntry(file: File): RecoveryJournalEntry? {
+        return try {
+            if (!file.exists() || !file.isFile) return null
+            if (file.length() > MAX_JOURNAL_SIZE) return null
+
+            val atomicFile = AtomicFile(file)
+            val bytes = atomicFile.openRead().use { input ->
+                val output = java.io.ByteArrayOutputStream()
+                val buffer = ByteArray(1024)
+                var total = 0
+
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count == -1) break
+
+                    total += count
+                    if (total > MAX_JOURNAL_SIZE) {
+                        return null
+                    }
+
+                    output.write(buffer, 0, count)
+                }
+
+                output.toByteArray()
+            }
+
+            deserialize(bytes)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun writeEntry(
+        file: File,
+        entry: RecoveryJournalEntry
+    ): Boolean {
+        if (!isValidEntry(entry)) return false
+
+        return try {
+            if (!journalDirectory.exists() &&
+                !journalDirectory.mkdirs()
+            ) {
+                return false
+            }
+
+            val bytes = serialize(entry)
+            if (bytes.size > MAX_JOURNAL_SIZE) return false
+
+            val atomicFile = AtomicFile(file)
+            val output = atomicFile.startWrite()
+
+            try {
+                output.write(bytes)
+                atomicFile.finishWrite(output)
+                true
+            } catch (exception: Exception) {
+                atomicFile.failWrite(output)
+                false
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private suspend fun calculateSha256(file: File): String? =
+        withContext(Dispatchers.IO) {
+            try {
+                if (!file.exists() || !file.isFile) return@withContext null
+                if (file.length() > MAX_TARGET_FILE_SIZE) {
+                    return@withContext null
+                }
+
+                val digest = MessageDigest.getInstance("SHA-256")
+
+                file.inputStream().use { input ->
+                    val buffer = ByteArray(8192)
+                    var total = 0L
+
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count == -1) break
+
+                        total += count
+                        if (total > MAX_TARGET_FILE_SIZE) {
+                            return@withContext null
+                        }
+
+                        digest.update(buffer, 0, count)
+                    }
+                }
+
+                digest.digest().joinToString("") {
+                    "%02x".format(it)
+                }
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+    suspend fun create(
+        projectPath: String,
+        filePath: String,
+        backupPath: String,
+        beforeHash: String,
+        targetHash: String,
+        operationType: RecoveryOperationType
+    ): RecoveryJournalEntry? = withContext(Dispatchers.IO) {
+
+        if (projectPath.isBlank() ||
+            filePath.isBlank() ||
+            backupPath.isBlank()
+        ) {
+            return@withContext null
+        }
+
+        if (!isValidHash(beforeHash) || !isValidHash(targetHash)) {
+            return@withContext null
+        }
 
         try {
-
-            // مرحله اول: بررسی Journal قبل از بارگذاری پروژه
-            val recoveryResults = withContext(Dispatchers.IO) {
-                changeManager.recoverPendingOperations(
-                    currentProject
-                )
+            if (!journalDirectory.exists() &&
+                !journalDirectory.mkdirs()
+            ) {
+                return@withContext null
             }
 
-            recoveryMessages.clear()
+            val id = UUID.randomUUID().toString()
 
-            if (recoveryResults.isEmpty()) {
-                recoveryMessages.add(
-                    "بررسی بازیابی انجام شد؛ عملیات نیمه‌تمامی برای این پروژه گزارش نشد."
-                )
-            } else {
-                recoveryMessages.addAll(recoveryResults)
-            }
-
-            // مرحله دوم: اسکن فایل‌های مجاز پروژه
-            val files = scanSafeProjectFiles(
-                context,
-                currentProject
+            val entry = RecoveryJournalEntry(
+                id = id,
+                projectPath = File(projectPath).canonicalPath,
+                filePath = File(filePath).canonicalPath,
+                backupPath = File(backupPath).canonicalPath,
+                beforeHash = beforeHash.lowercase(),
+                targetHash = targetHash.lowercase(),
+                operationType = operationType,
+                state = RecoveryOperationState.PREPARED,
+                createdAt = System.currentTimeMillis()
             )
 
-            projectFiles.clear()
-            projectFiles.addAll(files)
+            val file = journalFile(id)
+                ?: return@withContext null
 
-            if (files.isEmpty()) {
-                projectError =
-                    "فایل متنی قابل بررسی در پروژه پیدا نشد."
+            if (!writeEntry(file, entry)) {
+                return@withContext null
             }
 
-            // مرحله سوم: بارگذاری تاریخچه پس از بررسی Journal
-            val history = withContext(Dispatchers.IO) {
-                changeManager.getProjectHistory(currentProject)
-            }
+            entry
+        } catch (_: Exception) {
+            null
+        }
+    }
 
-            backupHistory.clear()
-            backupHistory.addAll(history)
+    suspend fun markCommitted(operationId: String): Boolean =
+        withContext(Dispatchers.IO) {
 
-        } catch (e: Exception) {
+            val file = journalFile(operationId)
+                ?: return@withContext false
 
-            projectError =
-                e.message ?: "بررسی و بارگذاری پروژه ناموفق بود."
+            val entry = readEntry(file)
+                ?: return@withContext false
 
-            recoveryMessages.add(
-                "بررسی بازیابی کامل نشد؛ برای جلوگیری از تغییر ناخواسته فایل‌ها، نتیجه را بررسی کن."
+            val updated = entry.copy(
+                state = RecoveryOperationState.COMMITTED
             )
 
-        } finally {
-            loadingProjectFiles = false
-            loadingBackupHistory = false
-            recoveryFinished = true
+            writeEntry(file, updated)
         }
-    }
 
-    // -------------------------------------------------
-    // انتخاب فایل پروژه
-    // -------------------------------------------------
+    suspend fun remove(operationId: String): Boolean =
+        withContext(Dispatchers.IO) {
 
-    fun selectProjectFile(file: File) {
-        if (busy) return
+            val file = journalFile(operationId)
+                ?: return@withContext false
 
-        val root = projectRoot ?: return
-
-        scope.launch {
-            loadingFile = true
-            errorMessage = ""
-            projectError = ""
+            if (!file.exists()) {
+                return@withContext true
+            }
 
             try {
-                val content = withContext(Dispatchers.IO) {
-                    if (!isSafeProjectFile(root, file)) {
-                        throw SecurityException(
-                            "این فایل اجازه خواندن ندارد."
-                        )
-                    }
-
-                    file.readText(Charsets.UTF_8)
-                }
-
-                code = content
-                selectedProjectFile = file
-
-                selectedLanguage = when (
-                    file.extension.lowercase()
-                ) {
-                    "kt" -> "Kotlin"
-                    "java" -> "Java"
-                    "py" -> "Python"
-                    "cpp" -> "C++"
-                    "c", "h" -> "C"
-                    "html" -> "HTML"
-                    "css" -> "CSS"
-                    "js" -> "JavaScript"
-                    "sql" -> "SQL"
-                    "dart" -> "Dart"
-                    "swift" -> "Swift"
-                    else -> selectedLanguage
-                }
-
-                prompt =
-                    "فایل انتخاب‌شده را از نظر ساختار، خطاها و کیفیت کد بررسی کن."
-
-                result = ""
-                pendingChange = null
-                showChangeReview = false
-
-            } catch (e: Exception) {
-                projectError =
-                    e.message ?: "خواندن فایل انجام نشد."
-            } finally {
-                loadingFile = false
-            }
-        }
-    }
-
-    // -------------------------------------------------
-    // ارسال درخواست به هوش مصنوعی
-    // -------------------------------------------------
-
-    fun sendRequest() {
-        if (busy) return
-
-        if (prompt.isBlank() && code.isBlank()) {
-            errorMessage =
-                "لطفاً توضیح درخواست یا کد خود را وارد کنید."
-            return
-        }
-
-        if (!modelAvailable) {
-            errorMessage =
-                "مدل هوش مصنوعی نصب نشده است. ابتدا از بخش مدیریت مدل آن را دریافت کنید."
-            return
-        }
-
-        val isFileCorrection =
-            selectedProjectFile != null &&
-                projectRoot != null &&
-                (
-                    selectedTask == "اصلاح کد" ||
-                    selectedTask == "رفع خطا"
-                )
-
-        val submittedCode = code
-        val submittedPrompt = prompt
-        val submittedFile = selectedProjectFile
-        val submittedRoot = projectRoot
-
-        if (isFileCorrection && submittedCode.isBlank()) {
-            errorMessage = "محتوای فایل برای اصلاح خالی است."
-            return
-        }
-
-        val selectedPath = submittedFile?.let { file ->
-            val root = submittedRoot
-
-            if (root != null) {
-                try {
-                    file.canonicalFile
-                        .relativeTo(root.canonicalFile)
-                        .path
-                } catch (_: Exception) {
-                    null
-                }
-            } else {
-                null
+                AtomicFile(file).delete()
+                !file.exists()
+            } catch (_: Exception) {
+                false
             }
         }
 
-        val formattedPrompt = buildString {
-            appendLine(
-                "You are a professional programming assistant."
-            )
-            appendLine(
-                "Answer in Persian unless code requires otherwise."
-            )
-            appendLine("Programming language: $selectedLanguage")
-            appendLine("Task: $selectedTask")
+    suspend fun getPendingEntries(
+        projectPath: String
+    ): List<RecoveryJournalEntry> = withContext(Dispatchers.IO) {
 
-            if (submittedRoot != null) {
-                appendLine("The user selected a local project.")
-            }
-
-            if (selectedPath != null) {
-                appendLine("Selected file: $selectedPath")
-            }
-
-            appendLine()
-            appendLine("User request:")
-            appendLine(
-                submittedPrompt.ifBlank {
-                    "Please analyze the provided code."
-                }
-            )
-
-            appendLine()
-            appendLine("User code:")
-            appendLine("```$selectedLanguage")
-            appendLine(submittedCode)
-            appendLine("```")
-
-            if (isFileCorrection) {
-                appendLine()
-                appendLine("IMPORTANT FILE CORRECTION RULES:")
-                appendLine(
-                    "Return the COMPLETE corrected file, not a partial snippet."
-                )
-                appendLine(
-                    "Do not omit imports, classes, functions, or unchanged sections."
-                )
-                appendLine(
-                    "Do not add explanations inside the code."
-                )
-                appendLine(
-                    "Do not claim that you modified the local file."
-                )
-                appendLine(
-                    "If you cannot safely produce the complete file, explain the limitation and do not produce a code block."
-                )
-                appendLine()
-                appendLine(
-                    "If you can provide the complete corrected file, format your response exactly like this:"
-                )
-                appendLine(AI_CODE_START)
-                appendLine("COMPLETE FILE CONTENT HERE")
-                appendLine(AI_CODE_END)
-                appendLine(
-                    "Replace the placeholder with the complete source code."
-                )
-            } else {
-                appendLine()
-                appendLine(
-                    "Analyze carefully and provide technically accurate advice."
-                )
-                appendLine(
-                    "If code changes are needed, explain exactly which file should change."
-                )
-                appendLine(
-                    "Do not claim that any local file has been modified."
-                )
-                appendLine(
-                    "Never request passwords, private keys, or secret credentials."
-                )
-                appendLine(
-                    "When generating or fixing code, provide complete code where practical."
-                )
-            }
+        if (projectPath.isBlank()) {
+            return@withContext emptyList()
         }
 
-        generating = true
-        errorMessage = ""
-        result = ""
-        pendingChange = null
-        showChangeReview = false
-
-        scope.launch {
-            try {
-                val response = engine.generate(formattedPrompt)
-
-                if (response.isBlank()) {
-                    errorMessage = "مدل پاسخ خالی برگرداند."
-                    return@launch
-                }
-
-                if (!isFileCorrection) {
-                    result = response
-                    return@launch
-                }
-
-                val proposedContent =
-                    extractProposedCode(response)
-
-                if (proposedContent == null) {
-                    result = response
-                    errorMessage =
-                        "مدل کد کامل را در قالب موردنیاز برنگرداند؛ هیچ فایلی تغییر نکرد."
-                    return@launch
-                }
-
-                val root = submittedRoot
-                val file = submittedFile
-
-                if (root == null || file == null) {
-                    errorMessage =
-                        "پروژه یا فایل انتخاب‌شده معتبر نیست."
-                    return@launch
-                }
-
-                val diskContent = withContext(Dispatchers.IO) {
-                    if (!isSafeProjectFile(root, file)) {
-                        throw SecurityException(
-                            "فایل دیگر در مسیر مجاز قرار ندارد."
-                        )
-                    }
-
-                    file.readText(Charsets.UTF_8)
-                }
-
-                if (diskContent != submittedCode) {
-                    errorMessage =
-                        "محتوای فایل از زمان بارگذاری تغییر کرده است. فایل را دوباره انتخاب و تحلیل کن."
-                    return@launch
-                }
-
-                val preview = changeManager.prepareChange(
-                    project = root,
-                    file = file,
-                    proposedContent = proposedContent
-                )
-
-                if (preview == null) {
-                    errorMessage =
-                        "ساخت پیشنهاد اصلاح امن ممکن نشد. فایل اصلی تغییر نکرد."
-                    return@launch
-                }
-
-                originalPreviewContent = submittedCode
-                pendingChange = preview
-                result =
-                    "پیشنهاد اصلاح آماده است. نسخه‌ها را در پنجره بازبینی بررسی کن."
-                showChangeReview = true
-
-            } catch (e: Exception) {
-                errorMessage =
-                    "خطا در اجرای درخواست: ${
-                        e.message ?: "خطای نامشخص"
-                    }"
-            } finally {
-                generating = false
-            }
-        }
-    }
-
-    // -------------------------------------------------
-    // تأیید و اعمال اصلاح پیشنهادی
-    // -------------------------------------------------
-
-    fun confirmProjectChange() {
-        val preview = pendingChange ?: return
-
-        if (busy) return
-
-        scope.launch {
-            applyingChange = true
-            errorMessage = ""
-
-            try {
-                val changeResult = changeManager.applyChange(
-                    preview = preview,
-                    ownerConfirmed = true
-                )
-
-                when (changeResult) {
-                    is ProjectFileChangeResult.Applied -> {
-                        code = preview.proposedContent
-
-                        lastBackupPath = changeResult.backupPath
-                        undoTargetFile = File(preview.filePath)
-
-                        result =
-                            "اصلاح با موفقیت اعمال شد. نسخه پشتیبان ذخیره شد؛ امکان بازگردانی وجود دارد."
-
-                        projectError =
-                            "نسخه پشتیبان آخرین اصلاح آماده بازگردانی است."
-
-                        pendingChange = null
-                        showChangeReview = false
-
-                        refreshBackupHistory()
-                    }
-
-                    is ProjectFileChangeResult.Rejected -> {
-                        errorMessage = changeResult.reason
-                    }
-                }
-
-            } catch (e: Exception) {
-                errorMessage =
-                    e.message ?: "اعمال اصلاح ناموفق بود."
-            } finally {
-                applyingChange = false
-            }
-        }
-    }
-
-    // -------------------------------------------------
-    // بازگردانی آخرین اصلاح
-    // -------------------------------------------------
-
-    fun restoreLastChange() {
-        val backup = lastBackupPath ?: return
-        val target = undoTargetFile ?: return
-        val root = projectRoot ?: return
-
-        if (busy) return
-
-        scope.launch {
-            restoringBackup = true
-            errorMessage = ""
-
-            try {
-                val restoreResult = changeManager.restoreBackup(
-                    project = root,
-                    file = target,
-                    backupPath = backup,
-                    ownerConfirmed = true
-                )
-
-                when (restoreResult) {
-                    is ProjectFileRestoreResult.Restored -> {
-                        val restoredContent =
-                            withContext(Dispatchers.IO) {
-                                target.readText(Charsets.UTF_8)
-                            }
-
-                        if (
-                            selectedProjectFile?.canonicalPath ==
-                            target.canonicalPath
-                        ) {
-                            code = restoredContent
-                        }
-
-                        result =
-                            "بازگردانی موفق بود. فایل به نسخه قبل از آخرین اصلاح برگشت."
-
-                        projectError =
-                            "آخرین اصلاح بازگردانی شد. نسخه پشتیبان همچنان حفظ شده است."
-
-                        lastBackupPath = null
-                        undoTargetFile = null
-                        showRestoreConfirmation = false
-
-                        refreshBackupHistory()
-                    }
-
-                    is ProjectFileRestoreResult.Rejected -> {
-                        errorMessage = restoreResult.reason
-                        showRestoreConfirmation = false
-                    }
-                }
-
-            } catch (e: Exception) {
-                errorMessage =
-                    e.message ?: "بازگردانی نسخه پشتیبان ناموفق بود."
-            } finally {
-                restoringBackup = false
-            }
-        }
-    }
-
-    // -------------------------------------------------
-    // بازگردانی نسخه تاریخی انتخاب‌شده
-    // -------------------------------------------------
-
-    fun restoreHistoricalVersion(entry: ProjectBackupEntry) {
-
-        val root = projectRoot ?: run {
-            errorMessage = "پروژه انتخاب‌شده معتبر نیست."
-            return
+        val canonicalProject = try {
+            File(projectPath).canonicalPath
+        } catch (_: Exception) {
+            return@withContext emptyList()
         }
 
-        if (busy) return
-
-        if (!entry.isValid) {
-            errorMessage =
-                "این نسخه سالم نیست و امکان بازگردانی آن وجود ندارد."
-            return
-        }
-
-        val target = File(entry.filePath)
-
-        restoringBackup = true
-        errorMessage = ""
-        backupHistoryError = ""
-
-        scope.launch {
-            try {
-
-                val restoreResult = changeManager.restoreHistoricalBackup(
-                    project = root,
-                    file = target,
-                    backupPath = entry.backupPath,
-                    ownerConfirmed = true
-                )
-
-                when (restoreResult) {
-
-                    is ProjectFileRestoreResult.Restored -> {
-
-                        val restoredContent =
-                            withContext(Dispatchers.IO) {
-
-                                if (!isSafeProjectFile(root, target)) {
-                                    throw SecurityException(
-                                        "فایل بازگردانی‌شده در مسیر مجاز قرار ندارد."
-                                    )
-                                }
-
-                                target.readText(Charsets.UTF_8)
-                            }
-
-                        val selectedFileMatches = try {
-                            selectedProjectFile?.canonicalPath ==
-                                target.canonicalPath
-                        } catch (_: Exception) {
-                            false
-                        }
-
-                        if (selectedFileMatches) {
-                            code = restoredContent
-                        }
-
-                        lastBackupPath = null
-                        undoTargetFile = null
-                        showRestoreConfirmation = false
-
-                        result =
-                            "نسخه تاریخی با موفقیت بازگردانی شد."
-
-                        projectError =
-                            "نسخه فعلی قبل از بازگردانی نیز به‌عنوان پشتیبان ذخیره شد."
-
-                        val updatedHistory =
-                            withContext(Dispatchers.IO) {
-                                changeManager.getProjectHistory(root)
-                            }
-
-                        backupHistory.clear()
-                        backupHistory.addAll(updatedHistory)
-                    }
-
-                    is ProjectFileRestoreResult.Rejected -> {
-                        errorMessage = restoreResult.reason
-                    }
-                }
-
-            } catch (e: Exception) {
-                errorMessage =
-                    e.message ?: "بازگردانی نسخه تاریخی ناموفق بود."
-            } finally {
-                restoringBackup = false
-            }
-        }
-    }
-
-    // -------------------------------------------------
-    // رابط کاربری
-    // -------------------------------------------------
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-    ) {
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically
+        if (!journalDirectory.exists() ||
+            !journalDirectory.isDirectory
         ) {
-            IconButton(
-                onClick = onBack,
-                enabled = !busy
-            ) {
-                Text("←", fontSize = 27.sp)
-            }
-
-            Column(
-                modifier = Modifier.weight(1f)
-            ) {
-                Text(
-                    "دستیار برنامه‌نویسی",
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.titleLarge
-                )
-
-                Text(
-                    "FARID TECH AI",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.labelSmall
-                )
-            }
-
-            Surface(
-                color = ProgrammingGreen.copy(alpha = 0.13f),
-                shape = RoundedCornerShape(50.dp)
-            ) {
-                Text(
-                    "AI",
-                    modifier = Modifier.padding(
-                        horizontal = 14.dp,
-                        vertical = 8.dp
-                    ),
-                    color = ProgrammingGreen,
-                    fontWeight = FontWeight.Bold
-                )
-            }
+            return@withContext emptyList()
         }
 
-        HorizontalDivider(
-            color = MaterialTheme.colorScheme.outlineVariant
-        )
-
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(18.dp)
-        ) {
-
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(22.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = Color(0xFF173D36)
-                )
-            ) {
-                Column(
-                    modifier = Modifier.padding(20.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Text("👨‍💻", fontSize = 32.sp)
-
-                    Text(
-                        "همراه هوشمند برنامه‌نویسی",
-                        color = Color.White,
-                        fontWeight = FontWeight.Bold,
-                        style = MaterialTheme.typography.titleLarge
-                    )
-
-                    Text(
-                        "کد تولید کن، خطاها را پیدا کن و پروژه‌هایت را توسعه بده.",
-                        color = Color(0xFFD9EEE5),
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                }
+        journalDirectory.listFiles()
+            ?.asSequence()
+            ?.filter {
+                it.isFile &&
+                    it.extension.equals("json", ignoreCase = true)
             }
+            ?.mapNotNull(::readEntry)
+            ?.filter { it.projectPath == canonicalProject }
+            ?.sortedBy { it.createdAt }
+            ?.toList()
+            ?: emptyList()
+    }
 
-            if (projectRoot != null) {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(18.dp)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Text(
-                            "📁 پروژه متصل",
-                            fontWeight = FontWeight.Bold,
-                            style = MaterialTheme.typography.titleMedium
-                        )
+    suspend fun inspectOperation(
+        entry: RecoveryJournalEntry
+    ): RecoveryCheckResult = withContext(Dispatchers.IO) {
 
-                        Text(
-                            projectRoot.name,
-                            color = ProgrammingGreen,
-                            fontWeight = FontWeight.SemiBold
-                        )
+        if (!isValidEntry(entry)) {
+            return@withContext RecoveryCheckResult.Invalid(
+                entry.id,
+                "اطلاعات عملیات بازیابی معتبر نیست."
+            )
+        }
 
-                        if (recoveryInProgress) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(10.dp)
-                            ) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(18.dp),
-                                    strokeWidth = 2.dp,
-                                    color = ProgrammingGreen
-                                )
+        val target = try {
+            File(entry.filePath).canonicalFile
+        } catch (_: Exception) {
+            return@withContext RecoveryCheckResult.Invalid(
+                entry.id,
+                "مسیر فایل اصلی معتبر نیست."
+            )
+        }
 
-                                Text(
-                                    "در حال بررسی عملیات نیمه‌تمام و بازیابی وضعیت پروژه...",
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                            }
-                        } else {
-                            Text(
-                                if (loadingProjectFiles) {
-                                    "در حال بررسی فایل‌های پروژه..."
-                                } else {
-                                    "${projectFiles.size} فایل مجاز برای بررسی پیدا شد."
-                                },
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                        }
+        val backup = try {
+            File(entry.backupPath).canonicalFile
+        } catch (_: Exception) {
+            return@withContext RecoveryCheckResult.Invalid(
+                entry.id,
+                "مسیر نسخه پشتیبان معتبر نیست."
+            )
+        }
 
-                        if (recoveryMessages.isNotEmpty()) {
-                            HorizontalDivider()
+        if (!target.exists() || !target.isFile) {
+            return@withContext RecoveryCheckResult.Pending(
+                entry.id,
+                "فایل اصلی پیدا نشد؛ بررسی دستی لازم است."
+            )
+        }
 
-                            Text(
-                                "وضعیت بازیابی پروژه",
-                                fontWeight = FontWeight.SemiBold
-                            )
+        if (!backup.exists() || !backup.isFile) {
+            return@withContext RecoveryCheckResult.Pending(
+                entry.id,
+                "نسخه پشتیبان پیدا نشد؛ عملیات نیازمند بررسی است."
+            )
+        }
 
-                            recoveryMessages.forEach { message ->
-                                Text(
-                                    message,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                            }
-                        }
+        if (backup.length() > MAX_TARGET_FILE_SIZE) {
+            return@withContext RecoveryCheckResult.Invalid(
+                entry.id,
+                "اندازه نسخه پشتیبان از حد مجاز بیشتر است."
+            )
+        }
 
-                        OutlinedButton(
-                            onClick = { showProjectFiles = true },
-                            enabled = !loadingProjectFiles && !busy,
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("انتخاب فایل از پروژه")
-                        }
+        val currentHash = calculateSha256(target)
+            ?: return@withContext RecoveryCheckResult.Pending(
+                entry.id,
+                "هش فایل فعلی قابل محاسبه نیست."
+            )
 
-                        selectedProjectFile?.let { file ->
-                            Text(
-                                "فایل انتخاب‌شده: ${file.name}",
-                                color = ProgrammingGreen,
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                        }
+        when (currentHash) {
+            entry.targetHash -> RecoveryCheckResult.Resolved(
+                entry.id,
+                "محتوای جدید با موفقیت ثبت شده است."
+            )
 
-                        if (loadingFile) {
-                            LinearProgressIndicator(
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                        }
+            entry.beforeHash -> RecoveryCheckResult.Resolved(
+                entry.id,
+                "محتوای قبلی فایل حفظ شده است."
+            )
 
-                        if (projectError.isNotBlank()) {
-                            Text(
-                                projectError,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                        }
-
-                        HorizontalDivider()
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column(
-                                modifier = Modifier.weight(1f),
-                                verticalArrangement = Arrangement.spacedBy(3.dp)
-                            ) {
-                                Text(
-                                    "🗂 تاریخچه نسخه‌های پشتیبان",
-                                    fontWeight = FontWeight.SemiBold
-                                )
-
-                                Text(
-                                    if (loadingBackupHistory) {
-                                        "در حال بارگذاری تاریخچه..."
-                                    } else {
-                                        "${backupHistory.size} نسخه پشتیبان ثبت شده"
-                                    },
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                            }
-
-                            TextButton(
-                                onClick = {
-                                    refreshBackupHistory()
-                                },
-                                enabled = !loadingBackupHistory && !busy
-                            ) {
-                                Text("به‌روزرسانی")
-                            }
-                        }
-
-                        OutlinedButton(
-                            onClick = {
-                                showBackupHistory = true
-                                refreshBackupHistory()
-                            },
-                            enabled = !loadingBackupHistory && !busy,
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(14.dp)
-                        ) {
-                            Text("مشاهده تاریخچه نسخه‌ها")
-                        }
-
-                        if (lastBackupPath != null) {
-                            HorizontalDivider()
-
-                            Text(
-                                "نسخه پشتیبان آخرین اصلاح آماده است.",
-                                color = ProgrammingGreen,
-                                style = MaterialTheme.typography.bodySmall
-                            )
-
-                            Button(
-                                onClick = {
-                                    showRestoreConfirmation = true
-                                },
-                                enabled = !busy,
-                                modifier = Modifier.fillMaxWidth(),
-                                shape = RoundedCornerShape(14.dp),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = Color(0xFFB45309),
-                                    contentColor = Color.White
-                                )
-                            ) {
-                                Text("↶  بازگردانی آخرین اصلاح")
-                            }
-                        }
-                    }
-                }
-            }
-
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(14.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        when {
-                            checkingModel -> "⏳"
-                            modelAvailable -> "🟢"
-                            else -> "⚠️"
-                        },
-                        fontSize = 20.sp
-                    )
-
-                    Spacer(Modifier.width(10.dp))
-
-                    Column {
-                        Text(
-                            "وضعیت مدل هوش مصنوعی",
-                            fontWeight = FontWeight.SemiBold
-                        )
-
-                        Text(
-                            when {
-                                checkingModel ->
-                                    "در حال بررسی فایل مدل..."
-                                modelAvailable ->
-                                    "مدل محلی شناسایی شد"
-                                else ->
-                                    "مدل نصب نشده است"
-                            },
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                }
-            }
-
-            Column(
-                verticalArrangement = Arrangement.spacedBy(9.dp)
-            ) {
-                Text(
-                    "زبان برنامه‌نویسی",
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.titleMedium
-                )
-
-                Box {
-                    OutlinedButton(
-                        onClick = {
-                            languageMenuExpanded = true
-                        },
-                        enabled = !busy,
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(14.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text(selectedLanguage)
-                            Text("⌄")
-                        }
-                    }
-
-                    DropdownMenu(
-                        expanded = languageMenuExpanded,
-                        onDismissRequest = {
-                            languageMenuExpanded = false
-                        }
-                    ) {
-                        programmingLanguages.forEach { language ->
-                            DropdownMenuItem(
-                                text = { Text(language) },
-                                onClick = {
-                                    selectedLanguage = language
-                                    languageMenuExpanded = false
-                                }
-                            )
-                        }
-                    }
-                }
-            }
-
-            Column(
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Text(
-                    "نوع درخواست",
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.titleMedium
-                )
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    programmingTasks.take(2).forEach { task ->
-                        FilterChip(
-                            selected = selectedTask == task,
-                            onClick = { selectedTask = task },
-                            enabled = !busy,
-                            label = { Text(task) },
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    programmingTasks.drop(2).forEach { task ->
-                        FilterChip(
-                            selected = selectedTask == task,
-                            onClick = { selectedTask = task },
-                            enabled = !busy,
-                            label = { Text(task) },
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                }
-            }
-
-            Column(
-                verticalArrangement = Arrangement.spacedBy(9.dp)
-            ) {
-                Text(
-                    "توضیح درخواست",
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.titleMedium
-                )
-
-                OutlinedTextField(
-                    value = prompt,
-                    onValueChange = {
-                        prompt = it
-                        errorMessage = ""
-                    },
-                    enabled = !busy,
-                    modifier = Modifier.fillMaxWidth(),
-                    placeholder = {
-                        Text(
-                            "مثلاً خطاهای این فایل را پیدا و توضیح بده..."
-                        )
-                    },
-                    minLines = 3,
-                    maxLines = 6,
-                    shape = RoundedCornerShape(16.dp)
-                )
-            }
-
-            Column(
-                verticalArrangement = Arrangement.spacedBy(9.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        "کد شما",
-                        fontWeight = FontWeight.Bold,
-                        style = MaterialTheme.typography.titleMedium
-                    )
-
-                    Text(
-                        selectedLanguage,
-                        color = ProgrammingGreen,
-                        style = MaterialTheme.typography.labelMedium
-                    )
-                }
-
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = Color(0xFF151A22)
-                    )
-                ) {
-                    Column(
-                        modifier = Modifier.padding(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("●", color = Color(0xFFFF6B6B))
-                            Spacer(Modifier.width(6.dp))
-                            Text("●", color = Color(0xFFFFC857))
-                            Spacer(Modifier.width(6.dp))
-                            Text("●", color = ProgrammingGreen)
-                            Spacer(Modifier.width(12.dp))
-
-                            Text(
-                                "Code Editor",
-                                color = Color(0xFFB5BAC4),
-                                style = MaterialTheme.typography.labelSmall
-                            )
-                        }
-
-                        HorizontalDivider(
-                            color = Color(0xFF343B47)
-                        )
-
-                        BasicTextField(
-                            value = code,
-                            onValueChange = {
-                                code = it
-                                errorMessage = ""
-                                pendingChange = null
-                                showChangeReview = false
-                            },
-                            enabled = !busy,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(min = 150.dp),
-                            textStyle = TextStyle(
-                                color = Color(0xFFE5EAF0),
-                                fontSize = 13.sp,
-                                lineHeight = 21.sp
-                            ),
-                            cursorBrush = SolidColor(ProgrammingGreen),
-                            decorationBox = { innerTextField ->
-                                Box {
-                                    if (code.isEmpty()) {
-                                        Text(
-                                            "کد خود را اینجا وارد کنید...",
-                                            color = Color(0xFF78818F),
-                                            fontSize = 13.sp
-                                        )
-                                    }
-                                    innerTextField()
-                                }
-                            }
-                        )
-                    }
-                }
-            }
-
-            if (errorMessage.isNotEmpty()) {
-                Text(
-                    errorMessage,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall
-                )
-            }
-
-            Button(
-                onClick = { sendRequest() },
-                enabled = !busy && !checkingModel,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp),
-                shape = RoundedCornerShape(16.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = ProgrammingGreen,
-                    contentColor = Color(0xFF062A1C)
-                )
-            ) {
-                if (generating) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(22.dp),
-                        color = Color(0xFF062A1C),
-                        strokeWidth = 2.dp
-                    )
-
-                    Spacer(Modifier.width(10.dp))
-                    Text("هوش مصنوعی در حال پردازش...")
-                } else {
-                    Text(
-                        "ارسال به هوش مصنوعی  ➜",
-                        fontWeight = FontWeight.Bold,
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                }
-            }
-
-            if (result.isNotBlank()) {
-                Column(
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Text(
-                        "پاسخ هوش مصنوعی",
-                        fontWeight = FontWeight.Bold,
-                        style = MaterialTheme.typography.titleLarge
-                    )
-
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(18.dp)
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(16.dp),
-                            verticalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            Text(
-                                result,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-
-                            OutlinedButton(
-                                onClick = {
-                                    prompt = ""
-                                    code = ""
-                                    result = ""
-                                    errorMessage = ""
-                                    selectedProjectFile = null
-                                    pendingChange = null
-                                    showChangeReview = false
-                                },
-                                enabled = !busy,
-                                modifier = Modifier.fillMaxWidth(),
-                                shape = RoundedCornerShape(12.dp)
-                            ) {
-                                Text("درخواست جدید")
-                            }
-                        }
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(12.dp))
+            else -> RecoveryCheckResult.Pending(
+                entry.id,
+                "محتوای فایل با وضعیت ثبت‌شده مطابقت ندارد؛ بازیابی خودکار انجام نشد."
+            )
         }
     }
 
-    // -------------------------------------------------
-    // پنجره انتخاب فایل پروژه
-    // -------------------------------------------------
+    suspend fun inspectAll(
+        projectPath: String
+    ): List<RecoveryCheckResult> {
 
-    if (showProjectFiles) {
-        AlertDialog(
-            onDismissRequest = {
-                if (!busy) showProjectFiles = false
-            },
-            title = {
-                Text("انتخاب فایل پروژه")
-            },
-            text = {
-                if (projectFiles.isEmpty()) {
-                    Text("فایل قابل بررسی وجود ندارد.")
-                } else {
-                    LazyColumn(
-                        modifier = Modifier.heightIn(max = 400.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        items(
-                            items = projectFiles,
-                            key = { it.absolutePath }
-                        ) { file ->
-                            val relativePath = try {
-                                file.relativeTo(
-                                    projectRoot ?: file.parentFile!!
-                                ).path
-                            } catch (_: Exception) {
-                                file.name
-                            }
+        val entries = getPendingEntries(projectPath)
 
-                            TextButton(
-                                onClick = {
-                                    selectProjectFile(file)
-                                },
-                                enabled = !busy,
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Column(
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Text(
-                                        file.name,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-
-                                    Text(
-                                        relativePath,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        style = MaterialTheme.typography.labelSmall
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showProjectFiles = false
-                    },
-                    enabled = !busy
-                ) {
-                    Text("بستن")
-                }
-            }
-        )
-    }
-
-    // -------------------------------------------------
-    // پنجره تاریخچه و بازگردانی نسخه‌های قدیمی
-    // -------------------------------------------------
-
-    if (showBackupHistory) {
-        ProjectBackupHistoryDialog(
-            history = backupHistory,
-            loading = loadingBackupHistory,
-            error = backupHistoryError.ifBlank {
-                null
-            },
-            restoring = restoringBackup || recoveryInProgress,
-            onRestore = { entry ->
-                restoreHistoricalVersion(entry)
-            },
-            onDismiss = {
-                if (!restoringBackup && !recoveryInProgress) {
-                    showBackupHistory = false
-                }
-            }
-        )
-    }
-
-    // -------------------------------------------------
-    // پنجره بازبینی و تأیید اصلاح
-    // -------------------------------------------------
-
-    val preview = pendingChange
-
-    if (showChangeReview && preview != null) {
-        ProjectChangeReviewDialog(
-            fileName = selectedProjectFile?.name ?: "فایل پروژه",
-            originalContent = originalPreviewContent,
-            proposedContent = preview.proposedContent,
-            applying = applyingChange || recoveryInProgress,
-            onConfirm = {
-                confirmProjectChange()
-            },
-            onCancel = {
-                if (!applyingChange && !recoveryInProgress) {
-                    showChangeReview = false
-                    pendingChange = null
-                    result =
-                        "پیشنهاد اصلاح رد شد؛ فایل اصلی بدون تغییر باقی ماند."
-                }
-            }
-        )
-    }
-
-    // -------------------------------------------------
-    // تأیید جداگانه برای بازگردانی آخرین نسخه
-    // -------------------------------------------------
-
-    if (showRestoreConfirmation) {
-        AlertDialog(
-            onDismissRequest = {
-                if (!restoringBackup && !recoveryInProgress) {
-                    showRestoreConfirmation = false
-                }
-            },
-            title = {
-                Text("بازگردانی آخرین اصلاح؟")
-            },
-            text = {
-                Column(
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text(
-                        "فایل زیر به نسخه قبل از آخرین اصلاح برمی‌گردد:"
-                    )
-
-                    Text(
-                        undoTargetFile?.name ?: "فایل پروژه",
-                        color = ProgrammingGreen,
-                        fontWeight = FontWeight.Bold
-                    )
-
-                    Text(
-                        "اگر فایل پس از اصلاح تغییر کرده باشد، عملیات برای جلوگیری از حذف تغییرات جدید متوقف می‌شود."
-                    )
-
-                    Text(
-                        "نسخه پشتیبان پس از بازگردانی حذف نخواهد شد.",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        restoreLastChange()
-                    },
-                    enabled = !restoringBackup && !recoveryInProgress,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFFB45309)
-                    )
-                ) {
-                    if (restoringBackup) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(18.dp),
-                            color = Color.White,
-                            strokeWidth = 2.dp
-                        )
-                    } else {
-                        Text("تأیید و بازگردانی")
-                    }
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = {
-                        showRestoreConfirmation = false
-                    },
-                    enabled = !restoringBackup && !recoveryInProgress
-                ) {
-                    Text("انصراف")
-                }
-            }
-        )
+        return entries.map { entry ->
+            inspectOperation(entry)
+        }
     }
 }
