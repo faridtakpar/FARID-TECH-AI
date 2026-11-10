@@ -28,7 +28,8 @@ private data class ProjectTreeEntry(
 @Composable
 fun AppBuilderScreen(
     context: Context,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    initialProject: File? = null
 ) {
     val scope = rememberCoroutineScope()
 
@@ -98,9 +99,7 @@ fun AppBuilderScreen(
                     ?: return
 
                 children.forEach { child ->
-                    result.add(
-                        ProjectTreeEntry(child, depth)
-                    )
+                    result.add(ProjectTreeEntry(child, depth))
 
                     if (child.isDirectory) {
                         scan(child, depth + 1)
@@ -113,9 +112,39 @@ fun AppBuilderScreen(
         }
     }
 
-    fun refreshTree(root: File) {
-        scope.launch {
-            entries = scanProject(root)
+    // بازکردن پروژه‌ای که از کتابخانه انتخاب شده است
+    LaunchedEffect(initialProject) {
+        val folder = initialProject ?: return@LaunchedEffect
+
+        try {
+            val projectsRoot = withContext(Dispatchers.IO) {
+                File(context.filesDir, "projects").canonicalFile
+            }
+
+            val validFolder = withContext(Dispatchers.IO) {
+                folder.canonicalFile
+            }
+
+            if (
+                !validFolder.isDirectory ||
+                !validFolder.toPath().startsWith(projectsRoot.toPath())
+            ) {
+                error = "مسیر پروژه معتبر نیست."
+                return@LaunchedEffect
+            }
+
+            projectFolder = validFolder
+            currentDirectory = validFolder
+            projectName = validFolder.name
+            selectedFile = null
+            editorText = ""
+            entries = scanProject(validFolder)
+
+            message = "پروژه قبلی با موفقیت باز شد."
+            error = ""
+
+        } catch (_: Exception) {
+            error = "بازکردن پروژه ناموفق بود."
         }
     }
 
@@ -219,7 +248,7 @@ fun AppBuilderScreen(
         val parent = currentDirectory ?: root
         val name = newItemName.trim()
 
-        if (!isInsideProject(parent, root) && parent != root) {
+        if (!isInsideProject(parent, root)) {
             error = "مسیر پوشه معتبر نیست."
             return
         }
@@ -395,7 +424,7 @@ fun AppBuilderScreen(
     ) {
 
         TextButton(onClick = onBack) {
-            Text("← بازگشت به داشبورد")
+            Text("← بازگشت")
         }
 
         Text(
