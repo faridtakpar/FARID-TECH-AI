@@ -2,33 +2,54 @@
 package com.faridtech.ai
 
 import android.content.Context
+import android.util.AtomicFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 import java.security.MessageDigest
-import java.util.Date
+import java.util.UUID
 
-data class ProjectBackupEntry(
-    val backupId: String,
+data class ProjectFileChangePreview(
     val projectPath: String,
     val filePath: String,
-    val fileName: String,
-    val backupPath: String,
-    val createdAt: Long,
     val originalHash: String,
-    val appliedHash: String,
-    val backupSize: Long,
-    val isHealthy: Boolean
+    val proposedContent: String,
+    val originalSize: Long
 )
 
-class ProjectBackupHistoryManager(context: Context) {
+sealed class ProjectFileChangeResult {
+
+    data class Applied(
+        val backupPath: String
+    ) : ProjectFileChangeResult()
+
+    data class Rejected(
+        val reason: String
+    ) : ProjectFileChangeResult()
+}
+
+sealed class ProjectFileRestoreResult {
+
+    data class Restored(
+        val filePath: String
+    ) : ProjectFileRestoreResult()
+
+    data class Rejected(
+        val reason: String
+    ) : ProjectFileRestoreResult()
+}
+
+class ProjectFileChangeManager(context: Context) {
 
     companion object {
+        private const val MAX_FILE_SIZE = 256 * 1024L
+
+        private const val MAX_MANIFEST_SIZE = 16 * 1024L
+
         private const val PROJECTS_DIRECTORY = "projects"
         private const val BACKUP_DIRECTORY = "project_backups"
-        private const val MAX_FILE_SIZE = 256 * 1024L
-        private const val MAX_MANIFEST_SIZE = 16 * 1024L
 
         private val ALLOWED_EXTENSIONS = setOf(
             "kt", "java", "xml", "gradle", "kts",
@@ -36,19 +57,31 @@ class ProjectBackupHistoryManager(context: Context) {
             "js", "cpp", "h", "c", "cmake",
             "pro", "sql", "py", "dart", "swift"
         )
+
+        private val BLOCKED_NAMES = setOf(
+            ".env",
+            ".env.local",
+            "local.properties",
+            "gradle.properties",
+            "key.properties"
+        )
+
+        private val BLOCKED_EXTENSIONS = setOf(
+            "keystore",
+            "jks",
+            "pem",
+            "p12",
+            "pfx"
+        )
     }
 
     private val appContext = context.applicationContext
 
-    private fun calculateHash(bytes: ByteArray): String {
-        val digest = MessageDigest
-            .getInstance("SHA-256")
-            .digest(bytes)
+    private val lock = Any()
 
-        return digest.joinToString("") {
-            "%02x".format(it)
-        }
-    }
+    // -------------------------------------------------
+    // اعتبارسنجی مسیر پروژه
+    // -------------------------------------------------
 
     private fun validateProject(project: File): File? {
         return try {
@@ -75,25 +108,46 @@ class ProjectBackupHistoryManager(context: Context) {
         }
     }
 
-    private fun isValidProjectFile(
+    // -------------------------------------------------
+    // اعتبارسنجی فایل
+    // -------------------------------------------------
+
+    private fun validateFile(
         projectRoot: File,
-        filePath: String
+        file: File
     ): File? {
         return try {
-            val target = File(filePath).canonicalFile
+            val root = projectRoot.canonicalFile
+            val target = file.canonicalFile
 
-            val prefix =
-                projectRoot.path + File.separator
+            val rootPrefix =
+                root.path + File.separator
 
-            if (!target.path.startsWith(prefix)) {
+            if (!target.path.startsWith(rootPrefix)) {
                 return null
             }
+
+            if (!target.isFile || !target.canRead()) {
+                return null
+            }
+
+            if (!target.canWrite()) {
+                return null
+            }
+
+            if (target.length() > MAX_FILE_SIZE) {
+                return null
+            }
+
+            val name = target.name.lowercase()
+
+            if (name in BLOCKED_NAMES) return null
 
             val extension = target.extension.lowercase()
 
-            if (extension !in ALLOWED_EXTENSIONS) {
-                return null
-            }
+            if (extension in BLOCKED_EXTENSIONS) return null
+
+            if (extension !in ALLOWED_EXTENSIONS) return null
 
             target
         } catch (_: Exception) {
@@ -101,217 +155,542 @@ class ProjectBackupHistoryManager(context: Context) {
         }
     }
 
-    private fun readBackupEntry(
-        projectRoot: File,
-        backupRoot: File,
-        manifestFile: File
-    ): ProjectBackupEntry? {
-        return try {
+    // -------------------------------------------------
+    // محاسبه هش فایل
+    // -------------------------------------------------
 
-            if (!manifestFile.isFile) return null
+    private fun calculateHash(bytes: ByteArray): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
 
-            if (
-                !manifestFile.path.startsWith(
-                    backupRoot.path + File.separator
-                )
-            ) {
-                return null
-            }
-
-            if (manifestFile.length() > MAX_MANIFEST_SIZE) {
-                return null
-            }
-
-            val manifest = JSONObject(
-                manifestFile.readText(Charsets.UTF_8)
-            )
-
-            val savedProjectPath =
-                manifest.optString("projectPath")
-
-            val savedFilePath =
-                manifest.optString("filePath")
-
-            val originalHash =
-                manifest.optString("originalHash")
-
-            val appliedHash =
-                manifest.optString("appliedHash")
-
-            val backupId =
-                manifest.optString("backupId")
-
-            val createdAt =
-                manifest.optLong("createdAt", 0L)
-
-            if (
-                savedProjectPath != projectRoot.path ||
-                originalHash.isBlank() ||
-                appliedHash.isBlank() ||
-                createdAt <= 0L ||
-                backupId.isBlank()
-            ) {
-                return null
-            }
-
-            if (
-                backupId != manifestFile.nameWithoutExtension
-            ) {
-                return null
-            }
-
-            val target = isValidProjectFile(
-                projectRoot,
-                savedFilePath
-            ) ?: return null
-
-            val backupFile = File(
-                backupRoot,
-                "$backupId.bak"
-            ).canonicalFile
-
-            val backupPrefix =
-                backupRoot.path + File.separator
-
-            if (
-                !backupFile.path.startsWith(backupPrefix) ||
-                !backupFile.isFile ||
-                !backupFile.canRead() ||
-                backupFile.length() <= 0L ||
-                backupFile.length() > MAX_FILE_SIZE
-            ) {
-                return null
-            }
-
-            val backupBytes = backupFile.readBytes()
-
-            val healthy =
-                calculateHash(backupBytes) == originalHash
-
-            ProjectBackupEntry(
-                backupId = backupId,
-                projectPath = projectRoot.path,
-                filePath = target.path,
-                fileName = target.name,
-                backupPath = backupFile.absolutePath,
-                createdAt = createdAt,
-                originalHash = originalHash,
-                appliedHash = appliedHash,
-                backupSize = backupBytes.size.toLong(),
-                isHealthy = healthy
-            )
-
-        } catch (_: Exception) {
-            null
+        return digest.joinToString("") {
+            "%02x".format(it)
         }
     }
 
-    /**
-     * دریافت تاریخچه نسخه‌های پشتیبان یک پروژه
-     */
-    suspend fun getProjectHistory(
-        project: File
-    ): List<ProjectBackupEntry> =
+    // -------------------------------------------------
+    // نوشتن اتمیک فایل
+    // -------------------------------------------------
+
+    private fun writeAtomically(
+        target: File,
+        bytes: ByteArray
+    ): Boolean {
+
+        var output: FileOutputStream? = null
+
+        val atomicFile = AtomicFile(target)
+
+        return try {
+            output = atomicFile.startWrite()
+
+            output.write(bytes)
+            output.fd.sync()
+
+            atomicFile.finishWrite(output)
+
+            output = null
+
+            true
+
+        } catch (_: Exception) {
+
+            if (output != null) {
+                try {
+                    atomicFile.failWrite(output)
+                } catch (_: Exception) {
+                }
+            }
+
+            false
+        }
+    }
+
+    // -------------------------------------------------
+    // ذخیره نسخه پشتیبان
+    // -------------------------------------------------
+
+    private fun writeBackup(
+        backupFile: File,
+        originalBytes: ByteArray
+    ): Boolean {
+        return writeAtomically(
+            backupFile,
+            originalBytes
+        )
+    }
+
+    // -------------------------------------------------
+    // ذخیره اطلاعات نسخه پشتیبان
+    // -------------------------------------------------
+
+    private fun writeManifest(
+        manifestFile: File,
+        json: JSONObject
+    ): Boolean {
+
+        return writeAtomically(
+            manifestFile,
+            json.toString(2).toByteArray(Charsets.UTF_8)
+        )
+    }
+
+    // -------------------------------------------------
+    // آماده‌سازی اصلاح فایل
+    // -------------------------------------------------
+
+    suspend fun prepareChange(
+        project: File,
+        file: File,
+        proposedContent: String
+    ): ProjectFileChangePreview? =
         withContext(Dispatchers.IO) {
 
             try {
 
                 val projectRoot = validateProject(project)
-                    ?: return@withContext emptyList()
+                    ?: return@withContext null
 
-                val backupRoot = File(
-                    appContext.filesDir,
-                    BACKUP_DIRECTORY
-                ).canonicalFile
+                val target = validateFile(
+                    projectRoot,
+                    file
+                ) ?: return@withContext null
 
-                if (!backupRoot.isDirectory) {
-                    return@withContext emptyList()
+                val proposedBytes =
+                    proposedContent.toByteArray(Charsets.UTF_8)
+
+                if (proposedBytes.isEmpty()) {
+                    return@withContext null
                 }
 
-                val manifests = backupRoot.listFiles()
-                    ?.filter {
-                        it.isFile &&
-                        it.extension.equals(
-                            "json",
-                            ignoreCase = true
+                if (proposedBytes.size > MAX_FILE_SIZE) {
+                    return@withContext null
+                }
+
+                val originalBytes = target.readBytes()
+
+                if (originalBytes.size > MAX_FILE_SIZE) {
+                    return@withContext null
+                }
+
+                val originalContent = String(
+                    originalBytes,
+                    Charsets.UTF_8
+                )
+
+                if (originalContent == proposedContent) {
+                    return@withContext null
+                }
+
+                ProjectFileChangePreview(
+                    projectPath = projectRoot.path,
+                    filePath = target.path,
+                    originalHash = calculateHash(originalBytes),
+                    proposedContent = proposedContent,
+                    originalSize = originalBytes.size.toLong()
+                )
+
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+    // -------------------------------------------------
+    // اعمال تغییرات با تأیید مالک
+    // -------------------------------------------------
+
+    suspend fun applyChange(
+        preview: ProjectFileChangePreview,
+        ownerConfirmed: Boolean
+    ): ProjectFileChangeResult =
+        withContext(Dispatchers.IO) {
+
+            if (!ownerConfirmed) {
+                return@withContext ProjectFileChangeResult.Rejected(
+                    "اعمال تغییر بدون تأیید مالک مجاز نیست."
+                )
+            }
+
+            synchronized(lock) {
+
+                try {
+
+                    val projectRoot = validateProject(
+                        File(preview.projectPath)
+                    ) ?: return@synchronized ProjectFileChangeResult.Rejected(
+                        "مسیر پروژه معتبر نیست."
+                    )
+
+                    val target = validateFile(
+                        projectRoot,
+                        File(preview.filePath)
+                    ) ?: return@synchronized ProjectFileChangeResult.Rejected(
+                        "فایل انتخاب‌شده معتبر یا قابل نوشتن نیست."
+                    )
+
+                    if (
+                        target.canonicalPath !=
+                        File(preview.filePath).canonicalPath
+                    ) {
+                        return@synchronized ProjectFileChangeResult.Rejected(
+                            "مسیر فایل تغییر کرده است."
                         )
                     }
-                    ?: return@withContext emptyList()
 
-                manifests.mapNotNull { manifest ->
-                    readBackupEntry(
-                        projectRoot,
-                        backupRoot,
-                        manifest
-                    )
-                }.sortedByDescending {
-                    it.createdAt
-                }
+                    val originalBytes = target.readBytes()
 
-            } catch (_: Exception) {
-                emptyList()
-            }
-        }
-
-    /**
-     * دریافت تاریخچه یک فایل مشخص
-     */
-    suspend fun getFileHistory(
-        project: File,
-        file: File
-    ): List<ProjectBackupEntry> =
-        withContext(Dispatchers.IO) {
-
-            try {
-
-                val projectRoot = validateProject(project)
-                    ?: return@withContext emptyList()
-
-                val target = isValidProjectFile(
-                    projectRoot,
-                    file.path
-                ) ?: return@withContext emptyList()
-
-                getProjectHistory(projectRoot)
-                    .filter {
-                        it.filePath == target.path
+                    if (originalBytes.size > MAX_FILE_SIZE) {
+                        return@synchronized ProjectFileChangeResult.Rejected(
+                            "اندازه فایل از حد مجاز بیشتر است."
+                        )
                     }
 
-            } catch (_: Exception) {
-                emptyList()
+                    val originalHash =
+                        calculateHash(originalBytes)
+
+                    if (originalHash != preview.originalHash) {
+                        return@synchronized ProjectFileChangeResult.Rejected(
+                            "فایل از زمان تحلیل تغییر کرده است. ابتدا دوباره آن را بررسی کنید."
+                        )
+                    }
+
+                    val proposedBytes =
+                        preview.proposedContent.toByteArray(
+                            Charsets.UTF_8
+                        )
+
+                    if (
+                        proposedBytes.isEmpty() ||
+                        proposedBytes.size > MAX_FILE_SIZE
+                    ) {
+                        return@synchronized ProjectFileChangeResult.Rejected(
+                            "محتوای پیشنهادی خالی یا بیش از حد مجاز است."
+                        )
+                    }
+
+                    val backupRoot = File(
+                        appContext.filesDir,
+                        BACKUP_DIRECTORY
+                    )
+
+                    if (
+                        !backupRoot.exists() &&
+                        !backupRoot.mkdirs()
+                    ) {
+                        return@synchronized ProjectFileChangeResult.Rejected(
+                            "ساخت پوشه نسخه پشتیبان ناموفق بود."
+                        )
+                    }
+
+                    if (!backupRoot.isDirectory) {
+                        return@synchronized ProjectFileChangeResult.Rejected(
+                            "مسیر نسخه پشتیبان معتبر نیست."
+                        )
+                    }
+
+                    val backupId = UUID.randomUUID().toString()
+
+                    val backupFile = File(
+                        backupRoot,
+                        "$backupId.bak"
+                    ).canonicalFile
+
+                    val manifestFile = File(
+                        backupRoot,
+                        "$backupId.json"
+                    ).canonicalFile
+
+                    // ابتدا نسخه اصلی ذخیره می‌شود.
+                    if (!writeBackup(backupFile, originalBytes)) {
+                        return@synchronized ProjectFileChangeResult.Rejected(
+                            "تهیه نسخه پشتیبان ناموفق بود؛ فایل اصلی تغییر نکرد."
+                        )
+                    }
+
+                    // ثبت اطلاعات نسخه پشتیبان
+                    val manifest = JSONObject().apply {
+
+                        put("projectPath", projectRoot.path)
+                        put("filePath", target.path)
+
+                        put("originalHash", originalHash)
+
+                        put(
+                            "appliedHash",
+                            calculateHash(proposedBytes)
+                        )
+
+                        put("backupId", backupId)
+
+                        put(
+                            "createdAt",
+                            System.currentTimeMillis()
+                        )
+                    }
+
+                    if (!writeManifest(manifestFile, manifest)) {
+                        return@synchronized ProjectFileChangeResult.Rejected(
+                            "ثبت اطلاعات نسخه پشتیبان ناموفق بود؛ فایل اصلی تغییر نکرد."
+                        )
+                    }
+
+                    // بررسی دوباره فایل قبل از اعمال
+                    val latestBytes = target.readBytes()
+
+                    if (
+                        calculateHash(latestBytes) != originalHash
+                    ) {
+                        return@synchronized ProjectFileChangeResult.Rejected(
+                            "فایل هنگام آماده‌سازی تغییر کرده است. اصلاح متوقف شد."
+                        )
+                    }
+
+                    // اعمال محتوای پیشنهادی
+                    val written = writeAtomically(
+                        target,
+                        proposedBytes
+                    )
+
+                    if (!written) {
+                        return@synchronized ProjectFileChangeResult.Rejected(
+                            "نوشتن فایل ناموفق بود. نسخه پشتیبان حفظ شده است."
+                        )
+                    }
+
+                    // بررسی صحت فایل نوشته‌شده
+                    val finalHash = calculateHash(
+                        target.readBytes()
+                    )
+
+                    val expectedHash =
+                        calculateHash(proposedBytes)
+
+                    if (finalHash != expectedHash) {
+
+                        val rollbackSucceeded = writeAtomically(
+                            target,
+                            originalBytes
+                        )
+
+                        if (rollbackSucceeded) {
+                            return@synchronized ProjectFileChangeResult.Rejected(
+                                "بررسی نهایی فایل ناموفق بود. نسخه اصلی بازیابی شد و پشتیبان حفظ شده است."
+                            )
+                        }
+
+                        return@synchronized ProjectFileChangeResult.Rejected(
+                            "بررسی نهایی فایل ناموفق بود و بازیابی نسخه اصلی نیز تأیید نشد. نسخه پشتیبان حفظ شده است."
+                        )
+                    }
+
+                    ProjectFileChangeResult.Applied(
+                        backupPath = backupFile.absolutePath
+                    )
+
+                } catch (e: Exception) {
+
+                    ProjectFileChangeResult.Rejected(
+                        e.message ?: "خطای نامشخص هنگام اعمال اصلاح."
+                    )
+                }
             }
         }
 
-    /**
-     * تبدیل زمان ثبت نسخه به متن قابل نمایش
-     */
-    fun formatBackupDate(timestamp: Long): String {
-        return try {
-            val formatter = java.text.SimpleDateFormat(
-                "yyyy/MM/dd - HH:mm",
-                java.util.Locale.getDefault()
-            )
+    // -------------------------------------------------
+    // بازگردانی امن نسخه پشتیبان
+    // -------------------------------------------------
 
-            formatter.format(Date(timestamp))
-        } catch (_: Exception) {
-            "تاریخ نامشخص"
-        }
-    }
+    suspend fun restoreBackup(
+        project: File,
+        file: File,
+        backupPath: String,
+        ownerConfirmed: Boolean
+    ): ProjectFileRestoreResult =
+        withContext(Dispatchers.IO) {
 
-    /**
-     * تبدیل حجم فایل به متن قابل نمایش
-     */
-    fun formatBackupSize(size: Long): String {
-        return when {
-            size < 1024 -> "$size B"
-            size < 1024 * 1024 ->
-                "%.1f KB".format(
-                    size / 1024.0
+            if (!ownerConfirmed) {
+                return@withContext ProjectFileRestoreResult.Rejected(
+                    "بازگردانی بدون تأیید مالک مجاز نیست."
                 )
-            else ->
-                "%.1f MB".format(
-                    size / (1024.0 * 1024.0)
-                )
+            }
+
+            synchronized(lock) {
+
+                try {
+
+                    val projectRoot = validateProject(project)
+                        ?: return@synchronized ProjectFileRestoreResult.Rejected(
+                            "مسیر پروژه معتبر نیست."
+                        )
+
+                    val target = validateFile(
+                        projectRoot,
+                        file
+                    ) ?: return@synchronized ProjectFileRestoreResult.Rejected(
+                        "فایل مقصد معتبر یا قابل نوشتن نیست."
+                    )
+
+                    val backupRoot = File(
+                        appContext.filesDir,
+                        BACKUP_DIRECTORY
+                    ).canonicalFile
+
+                    if (!backupRoot.isDirectory) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "پوشه نسخه‌های پشتیبان پیدا نشد."
+                        )
+                    }
+
+                    val backupFile = File(backupPath).canonicalFile
+
+                    val backupPrefix =
+                        backupRoot.path + File.separator
+
+                    if (
+                        !backupFile.path.startsWith(backupPrefix) ||
+                        !backupFile.isFile ||
+                        !backupFile.canRead() ||
+                        backupFile.length() > MAX_FILE_SIZE
+                    ) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "مسیر یا اندازه نسخه پشتیبان معتبر نیست."
+                        )
+                    }
+
+                    val manifestFile = File(
+                        backupFile.parentFile,
+                        backupFile.nameWithoutExtension + ".json"
+                    ).canonicalFile
+
+                    if (
+                        !manifestFile.path.startsWith(backupPrefix) ||
+                        !manifestFile.isFile ||
+                        !manifestFile.canRead() ||
+                        manifestFile.length() > MAX_MANIFEST_SIZE
+                    ) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "اطلاعات نسخه پشتیبان معتبر نیست."
+                        )
+                    }
+
+                    val manifest = JSONObject(
+                        manifestFile.readText(Charsets.UTF_8)
+                    )
+
+                    val savedProjectPath =
+                        manifest.optString("projectPath")
+
+                    val savedFilePath =
+                        manifest.optString("filePath")
+
+                    val originalHash =
+                        manifest.optString("originalHash")
+
+                    val appliedHash =
+                        manifest.optString("appliedHash")
+
+                    val backupId =
+                        manifest.optString("backupId")
+
+                    if (
+                        savedProjectPath != projectRoot.path ||
+                        savedFilePath != target.path ||
+                        backupId != backupFile.nameWithoutExtension ||
+                        originalHash.isBlank() ||
+                        appliedHash.isBlank()
+                    ) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "این نسخه پشتیبان متعلق به این فایل نیست."
+                        )
+                    }
+
+                    // نگهداری نسخه فعلی برای بازیابی احتمالی
+                    val currentBytes = target.readBytes()
+
+                    if (currentBytes.size > MAX_FILE_SIZE) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "اندازه فایل فعلی بیش از حد مجاز است."
+                        )
+                    }
+
+                    val currentHash =
+                        calculateHash(currentBytes)
+
+                    // جلوگیری از حذف تغییرات جدید کاربر
+                    if (currentHash != appliedHash) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "فایل پس از اصلاح تغییر کرده است. برای جلوگیری از حذف تغییرات جدید، بازگردانی متوقف شد."
+                        )
+                    }
+
+                    // بررسی سلامت نسخه پشتیبان
+                    val backupBytes = backupFile.readBytes()
+
+                    if (
+                        backupBytes.isEmpty() ||
+                        backupBytes.size > MAX_FILE_SIZE ||
+                        calculateHash(backupBytes) != originalHash
+                    ) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "نسخه پشتیبان خالی، آسیب‌دیده یا دستکاری شده است."
+                        )
+                    }
+
+                    // بازگردانی نسخه اصلی
+                    val restored = writeAtomically(
+                        target,
+                        backupBytes
+                    )
+
+                    if (!restored) {
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "بازگردانی نسخه پشتیبان ناموفق بود."
+                        )
+                    }
+
+                    // بررسی نهایی
+                    val finalBytes = target.readBytes()
+
+                    val restoreVerified =
+                        finalBytes.size <= MAX_FILE_SIZE &&
+                        calculateHash(finalBytes) == originalHash
+
+                    if (!restoreVerified) {
+
+                        // تلاش برای بازیابی نسخه قبل از بازگردانی
+                        val rollbackSucceeded = writeAtomically(
+                            target,
+                            currentBytes
+                        )
+
+                        if (rollbackSucceeded) {
+
+                            val rollbackBytes = target.readBytes()
+
+                            if (
+                                calculateHash(rollbackBytes) == currentHash
+                            ) {
+                                return@synchronized ProjectFileRestoreResult.Rejected(
+                                    "بررسی بازگردانی ناموفق بود؛ نسخه قبلی فایل بازیابی شد."
+                                )
+                            }
+                        }
+
+                        return@synchronized ProjectFileRestoreResult.Rejected(
+                            "بررسی بازگردانی ناموفق بود و بازیابی نسخه قبلی نیز تأیید نشد. نسخه پشتیبان اصلی همچنان حفظ شده است."
+                        )
+                    }
+
+                    ProjectFileRestoreResult.Restored(
+                        filePath = target.path
+                    )
+
+                } catch (e: Exception) {
+
+                    ProjectFileRestoreResult.Rejected(
+                        e.message ?: "خطای نامشخص هنگام بازگردانی."
+                    )
+                }
+            }
         }
-    }
 }
