@@ -179,6 +179,10 @@ fun ProgrammingScreen(
         ProjectFileChangeManager(context.applicationContext)
     }
 
+    val historyManager = remember(context) {
+        ProjectBackupHistoryManager(context.applicationContext)
+    }
+
     val scope = rememberCoroutineScope()
 
     var selectedLanguage by remember {
@@ -261,7 +265,7 @@ fun ProgrammingScreen(
         mutableStateOf(false)
     }
 
-    // اطلاعات آخرین نسخه پشتیبان برای بازگردانی
+    // اطلاعات آخرین نسخه پشتیبان
     var lastBackupPath by remember {
         mutableStateOf<String?>(null)
     }
@@ -278,6 +282,23 @@ fun ProgrammingScreen(
         mutableStateOf(false)
     }
 
+    // تاریخچه نسخه‌های پشتیبان
+    val backupHistory = remember {
+        mutableStateListOf<ProjectBackupEntry>()
+    }
+
+    var showBackupHistory by remember {
+        mutableStateOf(false)
+    }
+
+    var loadingBackupHistory by remember {
+        mutableStateOf(false)
+    }
+
+    var backupHistoryError by remember {
+        mutableStateOf("")
+    }
+
     val projectRoot = remember(project) {
         project?.absoluteFile
     }
@@ -286,6 +307,29 @@ fun ProgrammingScreen(
         applyingChange ||
         restoringBackup ||
         loadingFile
+
+    // بارگذاری تاریخچه نسخه‌های پشتیبان
+    fun refreshBackupHistory() {
+        val root = projectRoot ?: return
+
+        scope.launch {
+            loadingBackupHistory = true
+            backupHistoryError = ""
+
+            try {
+                val entries = historyManager.getProjectHistory(root)
+
+                backupHistory.clear()
+                backupHistory.addAll(entries)
+
+            } catch (e: Exception) {
+                backupHistoryError =
+                    e.message ?: "بارگذاری تاریخچه ناموفق بود."
+            } finally {
+                loadingBackupHistory = false
+            }
+        }
+    }
 
     LaunchedEffect(engine) {
         checkingModel = true
@@ -306,14 +350,17 @@ fun ProgrammingScreen(
         showChangeReview = false
         projectError = ""
 
-        // پشتیبان آخر را فقط تا زمانی که همین صفحه و پروژه فعال است نگه می‌داریم.
         lastBackupPath = null
         undoTargetFile = null
+
+        backupHistory.clear()
+        backupHistoryError = ""
 
         val currentProject = projectRoot
             ?: return@LaunchedEffect
 
         loadingProjectFiles = true
+        loadingBackupHistory = true
 
         try {
             val files = scanSafeProjectFiles(
@@ -327,11 +374,20 @@ fun ProgrammingScreen(
                 projectError =
                     "فایل متنی قابل بررسی در پروژه پیدا نشد."
             }
+
+            val history = historyManager.getProjectHistory(
+                currentProject
+            )
+
+            backupHistory.clear()
+            backupHistory.addAll(history)
+
         } catch (e: Exception) {
             projectError =
-                e.message ?: "خواندن فهرست پروژه ناموفق بود."
+                e.message ?: "خواندن اطلاعات پروژه ناموفق بود."
         } finally {
             loadingProjectFiles = false
+            loadingBackupHistory = false
         }
     }
 
@@ -624,7 +680,6 @@ fun ProgrammingScreen(
                     is ProjectFileChangeResult.Applied -> {
                         code = preview.proposedContent
 
-                        // ثبت پشتیبان آخرین اصلاح
                         lastBackupPath = changeResult.backupPath
                         undoTargetFile = File(preview.filePath)
 
@@ -636,6 +691,8 @@ fun ProgrammingScreen(
 
                         pendingChange = null
                         showChangeReview = false
+
+                        refreshBackupHistory()
                     }
 
                     is ProjectFileChangeResult.Rejected -> {
@@ -678,8 +735,6 @@ fun ProgrammingScreen(
                                 target.readText(Charsets.UTF_8)
                             }
 
-                        // فقط اگر همان فایل هنوز در ویرایشگر انتخاب شده باشد،
-                        // محتوای ویرایشگر را به نسخه بازگردانی‌شده تغییر می‌دهیم.
                         if (
                             selectedProjectFile?.canonicalPath ==
                             target.canonicalPath
@@ -696,6 +751,8 @@ fun ProgrammingScreen(
                         lastBackupPath = null
                         undoTargetFile = null
                         showRestoreConfirmation = false
+
+                        refreshBackupHistory()
                     }
 
                     is ProjectFileRestoreResult.Rejected -> {
@@ -863,6 +920,56 @@ fun ProgrammingScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 style = MaterialTheme.typography.bodySmall
                             )
+                        }
+
+                        // بخش تاریخچه نسخه‌های پشتیبان
+                        HorizontalDivider()
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(3.dp)
+                            ) {
+                                Text(
+                                    "🗂 تاریخچه نسخه‌های پشتیبان",
+                                    fontWeight = FontWeight.SemiBold
+                                )
+
+                                Text(
+                                    if (loadingBackupHistory) {
+                                        "در حال بارگذاری تاریخچه..."
+                                    } else {
+                                        "${backupHistory.size} نسخه پشتیبان ثبت شده"
+                                    },
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+
+                            TextButton(
+                                onClick = {
+                                    refreshBackupHistory()
+                                },
+                                enabled = !loadingBackupHistory
+                            ) {
+                                Text("به‌روزرسانی")
+                            }
+                        }
+
+                        OutlinedButton(
+                            onClick = {
+                                showBackupHistory = true
+                                refreshBackupHistory()
+                            },
+                            enabled = !loadingBackupHistory && !busy,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(14.dp)
+                        ) {
+                            Text("مشاهده تاریخچه نسخه‌ها")
                         }
 
                         // دکمه بازگردانی آخرین اصلاح
@@ -1149,8 +1256,7 @@ fun ProgrammingScreen(
 
             Button(
                 onClick = { sendRequest() },
-                enabled = !busy &&
-                    !checkingModel,
+                enabled = !busy && !checkingModel,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(56.dp),
@@ -1227,6 +1333,7 @@ fun ProgrammingScreen(
         }
     }
 
+    // پنجره انتخاب فایل پروژه
     if (showProjectFiles) {
         AlertDialog(
             onDismissRequest = {
@@ -1293,6 +1400,148 @@ fun ProgrammingScreen(
         )
     }
 
+    // پنجره تاریخچه نسخه‌های پشتیبان
+    if (showBackupHistory) {
+        AlertDialog(
+            onDismissRequest = {
+                showBackupHistory = false
+            },
+            title = {
+                Text("🗂 تاریخچه نسخه‌های پشتیبان")
+            },
+            text = {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text(
+                        projectRoot?.name ?: "پروژه",
+                        color = ProgrammingGreen,
+                        fontWeight = FontWeight.SemiBold
+                    )
+
+                    if (loadingBackupHistory) {
+                        LinearProgressIndicator(
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        Text("در حال دریافت تاریخچه...")
+                    } else if (backupHistoryError.isNotBlank()) {
+                        Text(
+                            backupHistoryError,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    } else if (backupHistory.isEmpty()) {
+                        Text(
+                            "هنوز نسخه پشتیبانی برای این پروژه ثبت نشده است.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier.heightIn(max = 420.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            items(
+                                items = backupHistory,
+                                key = { it.backupId }
+                            ) { entry ->
+
+                                Card(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(14.dp)
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Text(
+                                            entry.fileName,
+                                            fontWeight = FontWeight.Bold
+                                        )
+
+                                        Text(
+                                            entry.filePath.removePrefix(
+                                                entry.projectPath + File.separator
+                                            ),
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            style = MaterialTheme.typography.labelSmall
+                                        )
+
+                                        Text(
+                                            historyManager.formatBackupDate(
+                                                entry.createdAt
+                                            ),
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+
+                                        Text(
+                                            "حجم نسخه: ${
+                                                historyManager.formatBackupSize(
+                                                    entry.backupSize
+                                                )
+                                            }",
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.SpaceBetween
+                                        ) {
+                                            Text(
+                                                if (entry.isHealthy) {
+                                                    "نسخه پشتیبان سالم"
+                                                } else {
+                                                    "نسخه پشتیبان آسیب‌دیده"
+                                                },
+                                                color = if (entry.isHealthy) {
+                                                    ProgrammingGreen
+                                                } else {
+                                                    MaterialTheme.colorScheme.error
+                                                },
+                                                fontWeight = FontWeight.SemiBold,
+                                                style = MaterialTheme.typography.labelMedium
+                                            )
+
+                                            Text(
+                                                if (entry.isHealthy) "✓" else "!",
+                                                color = if (entry.isHealthy) {
+                                                    ProgrammingGreen
+                                                } else {
+                                                    MaterialTheme.colorScheme.error
+                                                },
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showBackupHistory = false
+                    }
+                ) {
+                    Text("بستن")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        refreshBackupHistory()
+                    },
+                    enabled = !loadingBackupHistory
+                ) {
+                    Text("تازه‌سازی")
+                }
+            }
+        )
+    }
+
     // پنجره بازبینی و تأیید اصلاح
     val preview = pendingChange
 
@@ -1316,7 +1565,7 @@ fun ProgrammingScreen(
         )
     }
 
-    // تأیید جداگانه برای بازگردانی نسخه پشتیبان
+    // تأیید جداگانه برای بازگردانی آخرین نسخه
     if (showRestoreConfirmation) {
         AlertDialog(
             onDismissRequest = {
