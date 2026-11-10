@@ -126,7 +126,8 @@ private suspend fun scanSafeProjectFiles(
             }
         }
         .forEach { file ->
-            if (result.size < 200 &&
+            if (
+                result.size < 200 &&
                 file.isFile &&
                 isSafeProjectFile(projectRoot, file)
             ) {
@@ -139,10 +140,6 @@ private suspend fun scanSafeProjectFiles(
     }
 }
 
-/**
- * استخراج کد کامل از پاسخ ساختاریافته مدل.
- * پاسخ بدون نشانگرهای مشخص، اجازه تبدیل به اصلاح فایل را ندارد.
- */
 private fun extractProposedCode(response: String): String? {
     val start = response.indexOf(AI_CODE_START)
     val end = response.indexOf(AI_CODE_END)
@@ -248,7 +245,6 @@ fun ProgrammingScreen(
         mutableStateOf("")
     }
 
-    // اطلاعات پیشنهاد اصلاح
     var pendingChange by remember {
         mutableStateOf<ProjectFileChangePreview?>(null)
     }
@@ -265,9 +261,31 @@ fun ProgrammingScreen(
         mutableStateOf(false)
     }
 
+    // اطلاعات آخرین نسخه پشتیبان برای بازگردانی
+    var lastBackupPath by remember {
+        mutableStateOf<String?>(null)
+    }
+
+    var undoTargetFile by remember {
+        mutableStateOf<File?>(null)
+    }
+
+    var showRestoreConfirmation by remember {
+        mutableStateOf(false)
+    }
+
+    var restoringBackup by remember {
+        mutableStateOf(false)
+    }
+
     val projectRoot = remember(project) {
         project?.absoluteFile
     }
+
+    val busy = generating ||
+        applyingChange ||
+        restoringBackup ||
+        loadingFile
 
     LaunchedEffect(engine) {
         checkingModel = true
@@ -288,7 +306,12 @@ fun ProgrammingScreen(
         showChangeReview = false
         projectError = ""
 
-        val currentProject = projectRoot ?: return@LaunchedEffect
+        // پشتیبان آخر را فقط تا زمانی که همین صفحه و پروژه فعال است نگه می‌داریم.
+        lastBackupPath = null
+        undoTargetFile = null
+
+        val currentProject = projectRoot
+            ?: return@LaunchedEffect
 
         loadingProjectFiles = true
 
@@ -313,7 +336,7 @@ fun ProgrammingScreen(
     }
 
     fun selectProjectFile(file: File) {
-        if (loadingFile || generating || applyingChange) return
+        if (busy) return
 
         val root = projectRoot ?: return
 
@@ -359,7 +382,6 @@ fun ProgrammingScreen(
                 result = ""
                 pendingChange = null
                 showChangeReview = false
-                showProjectFiles = false
 
             } catch (e: Exception) {
                 projectError =
@@ -371,7 +393,7 @@ fun ProgrammingScreen(
     }
 
     fun sendRequest() {
-        if (generating || applyingChange) return
+        if (busy) return
 
         if (prompt.isBlank() && code.isBlank()) {
             errorMessage =
@@ -388,8 +410,10 @@ fun ProgrammingScreen(
         val isFileCorrection =
             selectedProjectFile != null &&
                 projectRoot != null &&
-                (selectedTask == "اصلاح کد" ||
-                    selectedTask == "رفع خطا")
+                (
+                    selectedTask == "اصلاح کد" ||
+                    selectedTask == "رفع خطا"
+                )
 
         val submittedCode = code
         val submittedPrompt = prompt
@@ -451,9 +475,7 @@ fun ProgrammingScreen(
 
             if (isFileCorrection) {
                 appendLine()
-                appendLine(
-                    "IMPORTANT FILE CORRECTION RULES:"
-                )
+                appendLine("IMPORTANT FILE CORRECTION RULES:")
                 appendLine(
                     "Return the COMPLETE corrected file, not a partial snippet."
                 )
@@ -538,7 +560,6 @@ fun ProgrammingScreen(
                     return@launch
                 }
 
-                // بررسی اینکه نسخه روی دیسک با کد تحلیل‌شده یکسان باشد.
                 val diskContent = withContext(Dispatchers.IO) {
                     if (!isSafeProjectFile(root, file)) {
                         throw SecurityException(
@@ -570,7 +591,7 @@ fun ProgrammingScreen(
                 originalPreviewContent = submittedCode
                 pendingChange = preview
                 result =
-                    "پیشنهاد اصلاح آماده است. برای بررسی نسخه‌ها، پنجره بازبینی را مشاهده کن."
+                    "پیشنهاد اصلاح آماده است. نسخه‌ها را در پنجره بازبینی بررسی کن."
                 showChangeReview = true
 
             } catch (e: Exception) {
@@ -587,7 +608,7 @@ fun ProgrammingScreen(
     fun confirmProjectChange() {
         val preview = pendingChange ?: return
 
-        if (applyingChange) return
+        if (applyingChange || restoringBackup) return
 
         scope.launch {
             applyingChange = true
@@ -602,13 +623,16 @@ fun ProgrammingScreen(
                 when (changeResult) {
                     is ProjectFileChangeResult.Applied -> {
                         code = preview.proposedContent
-                        result =
-                            "اصلاح با موفقیت اعمال شد. نسخه پشتیبان نیز ذخیره شد."
 
-                        selectedProjectFile?.let { file ->
-                            projectError =
-                                "نسخه پشتیبان در حافظه داخلی برنامه ذخیره شد."
-                        }
+                        // ثبت پشتیبان آخرین اصلاح
+                        lastBackupPath = changeResult.backupPath
+                        undoTargetFile = File(preview.filePath)
+
+                        result =
+                            "اصلاح با موفقیت اعمال شد. نسخه پشتیبان ذخیره شد؛ امکان بازگردانی وجود دارد."
+
+                        projectError =
+                            "نسخه پشتیبان آخرین اصلاح آماده بازگردانی است."
 
                         pendingChange = null
                         showChangeReview = false
@@ -628,6 +652,67 @@ fun ProgrammingScreen(
         }
     }
 
+    fun restoreLastChange() {
+        val backup = lastBackupPath ?: return
+        val target = undoTargetFile ?: return
+        val root = projectRoot ?: return
+
+        if (restoringBackup || applyingChange) return
+
+        scope.launch {
+            restoringBackup = true
+            errorMessage = ""
+
+            try {
+                val restoreResult = changeManager.restoreBackup(
+                    project = root,
+                    file = target,
+                    backupPath = backup,
+                    ownerConfirmed = true
+                )
+
+                when (restoreResult) {
+                    is ProjectFileRestoreResult.Restored -> {
+                        val restoredContent =
+                            withContext(Dispatchers.IO) {
+                                target.readText(Charsets.UTF_8)
+                            }
+
+                        // فقط اگر همان فایل هنوز در ویرایشگر انتخاب شده باشد،
+                        // محتوای ویرایشگر را به نسخه بازگردانی‌شده تغییر می‌دهیم.
+                        if (
+                            selectedProjectFile?.canonicalPath ==
+                            target.canonicalPath
+                        ) {
+                            code = restoredContent
+                        }
+
+                        result =
+                            "بازگردانی موفق بود. فایل به نسخه قبل از آخرین اصلاح برگشت."
+
+                        projectError =
+                            "آخرین اصلاح بازگردانی شد. نسخه پشتیبان همچنان حفظ شده است."
+
+                        lastBackupPath = null
+                        undoTargetFile = null
+                        showRestoreConfirmation = false
+                    }
+
+                    is ProjectFileRestoreResult.Rejected -> {
+                        errorMessage = restoreResult.reason
+                        showRestoreConfirmation = false
+                    }
+                }
+
+            } catch (e: Exception) {
+                errorMessage =
+                    e.message ?: "بازگردانی نسخه پشتیبان ناموفق بود."
+            } finally {
+                restoringBackup = false
+            }
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -640,7 +725,10 @@ fun ProgrammingScreen(
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconButton(onClick = onBack) {
+            IconButton(
+                onClick = onBack,
+                enabled = !busy
+            ) {
                 Text("←", fontSize = 27.sp)
             }
 
@@ -749,10 +837,7 @@ fun ProgrammingScreen(
 
                         OutlinedButton(
                             onClick = { showProjectFiles = true },
-                            enabled = !loadingProjectFiles &&
-                                !loadingFile &&
-                                !generating &&
-                                !applyingChange,
+                            enabled = !loadingProjectFiles && !busy,
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Text("انتخاب فایل از پروژه")
@@ -775,9 +860,35 @@ fun ProgrammingScreen(
                         if (projectError.isNotBlank()) {
                             Text(
                                 projectError,
-                                color = MaterialTheme.colorScheme.error,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 style = MaterialTheme.typography.bodySmall
                             )
+                        }
+
+                        // دکمه بازگردانی آخرین اصلاح
+                        if (lastBackupPath != null) {
+                            HorizontalDivider()
+
+                            Text(
+                                "نسخه پشتیبان آخرین اصلاح آماده است.",
+                                color = ProgrammingGreen,
+                                style = MaterialTheme.typography.bodySmall
+                            )
+
+                            Button(
+                                onClick = {
+                                    showRestoreConfirmation = true
+                                },
+                                enabled = !busy,
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(14.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFFB45309),
+                                    contentColor = Color.White
+                                )
+                            ) {
+                                Text("↶  بازگردانی آخرین اصلاح")
+                            }
                         }
                     }
                 }
@@ -840,13 +951,13 @@ fun ProgrammingScreen(
                         onClick = {
                             languageMenuExpanded = true
                         },
+                        enabled = !busy,
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(14.dp)
                     ) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement =
-                                Arrangement.SpaceBetween
+                            horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Text(selectedLanguage)
                             Text("⌄")
@@ -889,6 +1000,7 @@ fun ProgrammingScreen(
                         FilterChip(
                             selected = selectedTask == task,
                             onClick = { selectedTask = task },
+                            enabled = !busy,
                             label = { Text(task) },
                             modifier = Modifier.weight(1f)
                         )
@@ -903,6 +1015,7 @@ fun ProgrammingScreen(
                         FilterChip(
                             selected = selectedTask == task,
                             onClick = { selectedTask = task },
+                            enabled = !busy,
                             label = { Text(task) },
                             modifier = Modifier.weight(1f)
                         )
@@ -925,6 +1038,7 @@ fun ProgrammingScreen(
                         prompt = it
                         errorMessage = ""
                     },
+                    enabled = !busy,
                     modifier = Modifier.fillMaxWidth(),
                     placeholder = {
                         Text(
@@ -998,6 +1112,7 @@ fun ProgrammingScreen(
                                 pendingChange = null
                                 showChangeReview = false
                             },
+                            enabled = !busy,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .heightIn(min = 150.dp),
@@ -1034,10 +1149,8 @@ fun ProgrammingScreen(
 
             Button(
                 onClick = { sendRequest() },
-                enabled = !generating &&
-                    !checkingModel &&
-                    !loadingFile &&
-                    !applyingChange,
+                enabled = !busy &&
+                    !checkingModel,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(56.dp),
@@ -1099,6 +1212,7 @@ fun ProgrammingScreen(
                                     pendingChange = null
                                     showChangeReview = false
                                 },
+                                enabled = !busy,
                                 modifier = Modifier.fillMaxWidth(),
                                 shape = RoundedCornerShape(12.dp)
                             ) {
@@ -1116,7 +1230,7 @@ fun ProgrammingScreen(
     if (showProjectFiles) {
         AlertDialog(
             onDismissRequest = {
-                showProjectFiles = false
+                if (!busy) showProjectFiles = false
             },
             title = {
                 Text("انتخاب فایل پروژه")
@@ -1127,8 +1241,7 @@ fun ProgrammingScreen(
                 } else {
                     LazyColumn(
                         modifier = Modifier.heightIn(max = 400.dp),
-                        verticalArrangement =
-                            Arrangement.spacedBy(6.dp)
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         items(
                             items = projectFiles,
@@ -1146,6 +1259,7 @@ fun ProgrammingScreen(
                                 onClick = {
                                     selectProjectFile(file)
                                 },
+                                enabled = !busy,
                                 modifier = Modifier.fillMaxWidth()
                             ) {
                                 Column(
@@ -1179,7 +1293,7 @@ fun ProgrammingScreen(
         )
     }
 
-    // پنجره بازبینی و تأیید مالک
+    // پنجره بازبینی و تأیید اصلاح
     val preview = pendingChange
 
     if (showChangeReview && preview != null) {
@@ -1195,7 +1309,78 @@ fun ProgrammingScreen(
                 if (!applyingChange) {
                     showChangeReview = false
                     pendingChange = null
-                    result = "پیشنهاد اصلاح رد شد؛ فایل اصلی بدون تغییر باقی ماند."
+                    result =
+                        "پیشنهاد اصلاح رد شد؛ فایل اصلی بدون تغییر باقی ماند."
+                }
+            }
+        )
+    }
+
+    // تأیید جداگانه برای بازگردانی نسخه پشتیبان
+    if (showRestoreConfirmation) {
+        AlertDialog(
+            onDismissRequest = {
+                if (!restoringBackup) {
+                    showRestoreConfirmation = false
+                }
+            },
+            title = {
+                Text("بازگردانی آخرین اصلاح؟")
+            },
+            text = {
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        "فایل زیر به نسخه قبل از آخرین اصلاح برمی‌گردد:"
+                    )
+
+                    Text(
+                        undoTargetFile?.name ?: "فایل پروژه",
+                        color = ProgrammingGreen,
+                        fontWeight = FontWeight.Bold
+                    )
+
+                    Text(
+                        "اگر فایل پس از اصلاح تغییر کرده باشد، عملیات برای جلوگیری از حذف تغییرات جدید متوقف می‌شود."
+                    )
+
+                    Text(
+                        "نسخه پشتیبان پس از بازگردانی حذف نخواهد شد.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        restoreLastChange()
+                    },
+                    enabled = !restoringBackup,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFFB45309)
+                    )
+                ) {
+                    if (restoringBackup) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            color = Color.White,
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Text("تأیید و بازگردانی")
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showRestoreConfirmation = false
+                    },
+                    enabled = !restoringBackup
+                ) {
+                    Text("انصراف")
                 }
             }
         )
