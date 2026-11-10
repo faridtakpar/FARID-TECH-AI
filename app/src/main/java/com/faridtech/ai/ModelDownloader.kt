@@ -10,20 +10,17 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
 
 internal object ModelStorageCoordinator {
 
     val engineMutex = Mutex()
     val downloadMutex = Mutex()
 
-    // مسیر مدل بارگذاری‌شده در موتور Native
     @Volatile
     var loadedModelPath: String? = null
 
-    /**
-     * فقط زمانی فراخوانی شود که engineMutex در اختیار باشد.
-     * حتی اگر مسیر Kotlin خالی باشد، موتور Native آزاد می‌شود.
-     */
+    // فقط هنگام در اختیار داشتن engineMutex فراخوانی شود.
     fun releaseLoadedModelLocked() {
         NativeLlama().nativeRelease()
         loadedModelPath = null
@@ -33,6 +30,7 @@ internal object ModelStorageCoordinator {
 class ModelDownloader(context: Context) {
 
     companion object {
+
         private const val MODEL_NAME =
             "Qwen2.5-Coder-1.5B-Q4_K_M.gguf"
 
@@ -42,6 +40,9 @@ class ModelDownloader(context: Context) {
         private const val EXPECTED_MODEL_SIZE =
             1_117_320_768L
 
+        private const val EXPECTED_SHA256 =
+            "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046"
+
         private const val MIN_MODEL_SIZE =
             500_000_000L
 
@@ -50,6 +51,7 @@ class ModelDownloader(context: Context) {
 
         private const val CONNECT_TIMEOUT = 30000
         private const val READ_TIMEOUT = 60000
+
     }
 
     private val appContext = context.applicationContext
@@ -69,6 +71,7 @@ class ModelDownloader(context: Context) {
         File(modelDirectory, "$MODEL_NAME.previous")
 
     private fun hasValidGgufHeader(file: File): Boolean {
+
         if (
             !file.exists() ||
             !file.isFile ||
@@ -78,7 +81,9 @@ class ModelDownloader(context: Context) {
         }
 
         return try {
+
             RandomAccessFile(file, "r").use { input ->
+
                 val magic = ByteArray(4)
                 input.readFully(magic)
 
@@ -91,21 +96,75 @@ class ModelDownloader(context: Context) {
                     return@use false
                 }
 
-                val version = Integer.reverseBytes(input.readInt())
+                val version =
+                    Integer.reverseBytes(input.readInt())
 
                 version in GGUF_VERSION_MIN..GGUF_VERSION_MAX
             }
+
         } catch (_: Exception) {
             false
         }
     }
 
+    /**
+     * محاسبه SHA-256 به‌صورت جریانی
+     * بدون بارگذاری کل فایل در حافظه RAM.
+     */
+    private fun calculateSha256(file: File): String {
+
+        val digest = MessageDigest.getInstance("SHA-256")
+
+        file.inputStream().buffered(64 * 1024).use { input ->
+
+            val buffer = ByteArray(64 * 1024)
+
+            while (true) {
+
+                val count = input.read(buffer)
+
+                if (count == -1) {
+                    break
+                }
+
+                digest.update(buffer, 0, count)
+            }
+        }
+
+        return digest.digest().joinToString("") { byte ->
+            "%02x".format(byte.toInt() and 0xff)
+        }
+    }
+
+    private fun hasValidSha256(file: File): Boolean {
+
+        if (
+            !file.exists() ||
+            !file.isFile ||
+            file.length() != EXPECTED_MODEL_SIZE
+        ) {
+            return false
+        }
+
+        return try {
+            calculateSha256(file) == EXPECTED_SHA256
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * اعتبارسنجی کامل فایل مدل:
+     * اندازه + سربرگ GGUF + هش SHA-256
+     */
     private fun isCompleteModel(file: File): Boolean {
+
         return file.exists() &&
             file.isFile &&
             file.length() == EXPECTED_MODEL_SIZE &&
             file.length() >= MIN_MODEL_SIZE &&
-            hasValidGgufHeader(file)
+            hasValidGgufHeader(file) &&
+            hasValidSha256(file)
     }
 
     /**
@@ -141,7 +200,7 @@ class ModelDownloader(context: Context) {
                 )
             }
 
-            // بررسی مدل و نسخه پشتیبان با قفل مشترک موتور
+            // بررسی فایل موجود و نسخه پشتیبان
             val alreadyComplete =
                 ModelStorageCoordinator.engineMutex.withLock {
 
@@ -149,6 +208,20 @@ class ModelDownloader(context: Context) {
                         throw IllegalStateException(
                             "نسخه پشتیبان قبلی وجود دارد؛ وضعیت فایل‌ها نیاز به بررسی دارد."
                         )
+                    }
+
+                    if (
+                        finalFile.exists() &&
+                        !isCompleteModel(finalFile)
+                    ) {
+
+                        ModelStorageCoordinator.releaseLoadedModelLocked()
+
+                        if (!finalFile.delete()) {
+                            throw IllegalStateException(
+                                "حذف مدل نامعتبر ناموفق بود."
+                            )
+                        }
                     }
 
                     isCompleteModel(finalFile)
@@ -171,6 +244,7 @@ class ModelDownloader(context: Context) {
                     !hasValidGgufHeader(partialFile) ||
                     partialFile.length() >= EXPECTED_MODEL_SIZE
                 ) {
+
                     if (!partialFile.delete()) {
                         throw IllegalStateException(
                             "حذف فایل موقت ناموفق بود."
@@ -355,10 +429,21 @@ class ModelDownloader(context: Context) {
                     partialFile.length() < MIN_MODEL_SIZE ||
                     !hasValidGgufHeader(partialFile)
                 ) {
+
                     partialFile.delete()
 
                     throw IllegalStateException(
                         "فایل دانلودشده معتبر نیست."
+                    )
+                }
+
+                // کنترل SHA-256 قبل از نصب
+                if (!hasValidSha256(partialFile)) {
+
+                    partialFile.delete()
+
+                    throw IllegalStateException(
+                        "هش SHA-256 فایل دانلودشده معتبر نیست؛ فایل رد شد."
                     )
                 }
 
@@ -382,7 +467,6 @@ class ModelDownloader(context: Context) {
 
                         try {
 
-                            // آزادسازی Native پیش از تغییر فایل مدل
                             ModelStorageCoordinator.releaseLoadedModelLocked()
 
                             if (finalFile.exists()) {
@@ -406,7 +490,7 @@ class ModelDownloader(context: Context) {
 
                             if (!isCompleteModel(finalFile)) {
                                 throw IllegalStateException(
-                                    "اعتبارسنجی فایل نهایی ناموفق بود."
+                                    "اعتبارسنجی نهایی SHA-256 یا فایل GGUF ناموفق بود."
                                 )
                             }
 
