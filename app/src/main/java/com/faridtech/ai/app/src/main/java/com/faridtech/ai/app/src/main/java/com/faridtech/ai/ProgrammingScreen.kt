@@ -300,7 +300,6 @@ fun ProgrammingScreen(
 
     // -------------------------------------------------
     // وضعیت ایمنی بازیابی پروژه
-    // با تغییر پروژه، وضعیت قبلی منتقل نمی‌شود.
     // -------------------------------------------------
 
     var recoveryInProgress by remember(projectRoot) {
@@ -319,7 +318,6 @@ fun ProgrammingScreen(
         mutableStateListOf<String>()
     }
 
-    // تا زمان بازیابی موفق، عملیات فایل مجاز نیست.
     val projectOperationsAllowed =
         projectRoot == null || recoveryReady
 
@@ -363,7 +361,7 @@ fun ProgrammingScreen(
 
             recoveryMessages.addAll(messages)
 
-            // فقط بعد از موفقیت بازیابی، قفل باز می‌شود.
+            // قفل فقط پس از موفقیت واقعی بازیابی باز می‌شود.
             recoverySucceeded = true
             recoveryReady = true
 
@@ -387,17 +385,30 @@ fun ProgrammingScreen(
             backupHistory.addAll(history)
 
         } catch (e: CancellationException) {
-            // لغو عملیات باید به فراخواننده منتقل شود.
             throw e
+
+        } catch (e: ProjectRecoveryException) {
+            // خطای مخصوص بازیابی امن
+            recoveryReady = false
+            recoverySucceeded = false
+
+            recoveryMessages.clear()
+            recoveryMessages.addAll(e.recoveryMessages)
+
+            recoveryError =
+                "بازیابی امن پروژه کامل نشد. جزئیات عملیات ناموفق در گزارش زیر آمده است."
 
         } catch (e: Exception) {
             if (!recoverySucceeded) {
                 recoveryReady = false
+
                 recoveryError =
-                    e.message ?: "بازیابی عملیات نیمه‌تمام ناموفق بود."
+                    e.message
+                        ?: "بازیابی عملیات نیمه‌تمام ناموفق بود."
             } else {
                 projectError =
-                    e.message ?: "بارگذاری اطلاعات پروژه ناموفق بود."
+                    e.message
+                        ?: "بارگذاری اطلاعات پروژه ناموفق بود."
             }
 
         } finally {
@@ -476,6 +487,7 @@ fun ProgrammingScreen(
             recoveryReady = true
             recoveryInProgress = false
             recoveryError = ""
+            recoveryMessages.clear()
             return@LaunchedEffect
         }
 
@@ -1171,6 +1183,24 @@ fun ProgrammingScreen(
                                         color = MaterialTheme.colorScheme.error,
                                         style = MaterialTheme.typography.bodySmall
                                     )
+                                }
+
+                                if (recoveryMessages.isNotEmpty()) {
+                                    HorizontalDivider()
+
+                                    Text(
+                                        "جزئیات خطاهای بازیابی",
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.error
+                                    )
+
+                                    recoveryMessages.forEachIndexed { index, message ->
+                                        Text(
+                                            "${index + 1}. $message",
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
                                 }
 
                                 Button(
