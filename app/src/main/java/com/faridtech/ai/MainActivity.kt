@@ -20,6 +20,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.faridtech.ai.security.OwnerSecurity
+import java.io.File
 
 private val BrandGreen = Color(0xFF19C37D)
 
@@ -129,11 +130,20 @@ fun OwnerAccessScreen(
     var confirmPassword by remember { mutableStateOf("") }
     var error by remember { mutableStateOf("") }
     var configured by remember { mutableStateOf(security.isConfigured()) }
-    var selectedSection by remember { mutableStateOf<String?>(null) }
+
+    var selectedSection by remember {
+        mutableStateOf<String?>(null)
+    }
+
+    // پروژه انتخاب‌شده از کتابخانه
+    var selectedProject by remember {
+        mutableStateOf<File?>(null)
+    }
 
     LaunchedEffect(unlocked) {
         if (!unlocked) {
             selectedSection = null
+            selectedProject = null
             password = ""
             confirmPassword = ""
             error = ""
@@ -145,6 +155,7 @@ fun OwnerAccessScreen(
         color = MaterialTheme.colorScheme.background
     ) {
         if (unlocked) {
+
             when (selectedSection) {
 
                 "هوش مصنوعی محلی" -> {
@@ -180,13 +191,51 @@ fun OwnerAccessScreen(
                     )
                 }
 
+                // ساخت پروژه جدید
                 "ساخت اپلیکیشن" -> {
                     AppBuilderScreen(
                         context = context,
                         onBack = {
+                            selectedProject = null
+                            selectedSection = null
+                        },
+                        initialProject = null
+                    )
+                }
+
+                // نمایش کتابخانه پروژه‌ها
+                "کتابخانه پروژه‌ها" -> {
+                    ProjectLibraryScreen(
+                        onOpenProject = { project ->
+                            selectedProject = project
+                            selectedSection = "ویرایش پروژه"
+                        },
+                        onCreateProject = {
+                            selectedProject = null
+                            selectedSection = "ساخت اپلیکیشن"
+                        },
+                        onBack = {
                             selectedSection = null
                         }
                     )
+                }
+
+                // بازکردن پروژه انتخاب‌شده در ویرایشگر
+                "ویرایش پروژه" -> {
+                    val project = selectedProject
+
+                    if (project != null) {
+                        AppBuilderScreen(
+                            context = context,
+                            onBack = {
+                                selectedSection = "کتابخانه پروژه‌ها"
+                                selectedProject = null
+                            },
+                            initialProject = project
+                        )
+                    } else {
+                        selectedSection = "کتابخانه پروژه‌ها"
+                    }
                 }
 
                 null -> {
@@ -205,7 +254,9 @@ fun OwnerAccessScreen(
                     )
                 }
             }
+
         } else {
+
             OwnerLoginScreen(
                 password = password,
                 onPasswordChange = {
@@ -327,10 +378,11 @@ private fun OwnerLoginScreen(
                     label = { Text("رمز شخصی مالک") },
                     visualTransformation =
                         androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
-                        keyboardType =
-                            androidx.compose.ui.text.input.KeyboardType.Password
-                    ),
+                    keyboardOptions =
+                        androidx.compose.foundation.text.KeyboardOptions(
+                            keyboardType =
+                                androidx.compose.ui.text.input.KeyboardType.Password
+                        ),
                     singleLine = true
                 )
 
@@ -342,10 +394,11 @@ private fun OwnerLoginScreen(
                         label = { Text("تکرار رمز شخصی") },
                         visualTransformation =
                             androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
-                            keyboardType =
-                                androidx.compose.ui.text.input.KeyboardType.Password
-                        ),
+                        keyboardOptions =
+                            androidx.compose.foundation.text.KeyboardOptions(
+                                keyboardType =
+                                    androidx.compose.ui.text.input.KeyboardType.Password
+                            ),
                         singleLine = true
                     )
                 }
@@ -599,6 +652,15 @@ fun OwnerDashboard(
                 onClick = { onSelect("ساخت اپلیکیشن") }
             )
         }
+
+        // دسترسی به کتابخانه پروژه‌ها
+        DashboardCard(
+            emoji = "📚",
+            title = "کتابخانه پروژه‌ها",
+            description = "مشاهده و بازکردن پروژه‌های ذخیره‌شده",
+            modifier = Modifier.fillMaxWidth(),
+            onClick = { onSelect("کتابخانه پروژه‌ها") }
+        )
 
         Row(
             modifier = Modifier.fillMaxWidth(),
