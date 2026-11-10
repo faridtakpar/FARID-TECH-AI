@@ -9,7 +9,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -19,8 +18,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.faridtech.ai.security.OwnerSecurity
 
@@ -183,6 +180,15 @@ fun OwnerAccessScreen(
                     )
                 }
 
+                "ساخت اپلیکیشن" -> {
+                    AppBuilderScreen(
+                        context = context,
+                        onBack = {
+                            selectedSection = null
+                        }
+                    )
+                }
+
                 null -> {
                     OwnerDashboard(
                         darkTheme = darkTheme,
@@ -319,9 +325,11 @@ private fun OwnerLoginScreen(
                     onValueChange = onPasswordChange,
                     modifier = Modifier.fillMaxWidth(),
                     label = { Text("رمز شخصی مالک") },
-                    visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(
-                        keyboardType = KeyboardType.Password
+                    visualTransformation =
+                        androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                        keyboardType =
+                            androidx.compose.ui.text.input.KeyboardType.Password
                     ),
                     singleLine = true
                 )
@@ -332,9 +340,11 @@ private fun OwnerLoginScreen(
                         onValueChange = onConfirmPasswordChange,
                         modifier = Modifier.fillMaxWidth(),
                         label = { Text("تکرار رمز شخصی") },
-                        visualTransformation = PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(
-                            keyboardType = KeyboardType.Password
+                        visualTransformation =
+                            androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                            keyboardType =
+                                androidx.compose.ui.text.input.KeyboardType.Password
                         ),
                         singleLine = true
                     )
