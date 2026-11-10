@@ -174,6 +174,15 @@ fun OwnerAccessScreen(
                     )
                 }
 
+                "برنامه‌نویسی و توسعه" -> {
+                    ProgrammingScreen(
+                        context = context,
+                        onBack = {
+                            selectedSection = null
+                        }
+                    )
+                }
+
                 null -> {
                     OwnerDashboard(
                         darkTheme = darkTheme,
@@ -265,14 +274,7 @@ private fun OwnerLoginScreen(
             modifier = Modifier
                 .size(76.dp)
                 .clip(RoundedCornerShape(24.dp))
-                .background(
-                    Brush.linearGradient(
-                        listOf(
-                            Color(0xFF19C37D),
-                            Color(0xFF087D53)
-                        )
-                    )
-                ),
+                .background(BrandGreen),
             contentAlignment = Alignment.Center
         ) {
             Text(
@@ -385,8 +387,6 @@ fun OwnerDashboard(
         verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {
 
-        // Header
-
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
@@ -430,21 +430,13 @@ fun OwnerDashboard(
             }
 
             IconButton(onClick = onToggleTheme) {
-                Text(
-                    if (darkTheme) "☀️" else "🌙",
-                    style = MaterialTheme.typography.titleLarge
-                )
+                Text(if (darkTheme) "☀️" else "🌙")
             }
 
             IconButton(onClick = onLock) {
-                Text(
-                    "🔒",
-                    style = MaterialTheme.typography.titleLarge
-                )
+                Text("🔒")
             }
         }
-
-        // Welcome banner
 
         Box(
             modifier = Modifier
@@ -514,8 +506,6 @@ fun OwnerDashboard(
             }
         }
 
-        // Main AI action
-
         DashboardSectionTitle(
             title = "دستیار هوشمند",
             subtitle = "شروع کار با هوش مصنوعی"
@@ -574,8 +564,6 @@ fun OwnerDashboard(
             }
         }
 
-        // Development tools
-
         DashboardSectionTitle(
             title = "ساخت و توسعه",
             subtitle = "ابزارهای برنامه‌نویسی و تولید نرم‌افزار"
@@ -623,8 +611,6 @@ fun OwnerDashboard(
             )
         }
 
-        // AI services
-
         DashboardSectionTitle(
             title = "مدیریت هوش مصنوعی",
             subtitle = "مدل‌ها و سرویس‌های هوشمند"
@@ -651,8 +637,6 @@ fun OwnerDashboard(
             )
         }
 
-        // Management
-
         DashboardSectionTitle(
             title = "مدیریت برنامه",
             subtitle = "تنظیمات و حفاظت از اطلاعات"
@@ -678,8 +662,6 @@ fun OwnerDashboard(
                 onClick = { onSelect("امنیت و مدیریت مالک") }
             )
         }
-
-        // Lock button
 
         OutlinedButton(
             onClick = onLock,
