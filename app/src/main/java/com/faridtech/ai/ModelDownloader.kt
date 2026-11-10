@@ -3,23 +3,28 @@ package com.faridtech.ai
 
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
 
+internal object ModelStorageCoordinator {
+    val engineMutex = Mutex()
+    val downloadMutex = Mutex()
+}
+
 class ModelDownloader(context: Context) {
 
     companion object {
-
         private const val MODEL_NAME =
             "Qwen2.5-Coder-1.5B-Q4_K_M.gguf"
 
         private const val MODEL_URL =
             "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
 
-        // Exact size of the selected Q4_K_M model.
         private const val EXPECTED_MODEL_SIZE =
             1_117_320_768L
 
@@ -33,7 +38,7 @@ class ModelDownloader(context: Context) {
         private const val READ_TIMEOUT = 60000
     }
 
-    private val modelDirectory: File = File(
+    private val modelDirectory = File(
         context.getExternalFilesDir(null) ?: context.filesDir,
         "models"
     )
@@ -48,7 +53,6 @@ class ModelDownloader(context: Context) {
         File(modelDirectory, "$MODEL_NAME.previous")
 
     private fun hasValidGgufHeader(file: File): Boolean {
-
         if (
             !file.exists() ||
             !file.isFile ||
@@ -58,11 +62,8 @@ class ModelDownloader(context: Context) {
         }
 
         return try {
-
             RandomAccessFile(file, "r").use { input ->
-
                 val magic = ByteArray(4)
-
                 input.readFully(magic)
 
                 if (
@@ -74,22 +75,15 @@ class ModelDownloader(context: Context) {
                     return@use false
                 }
 
-                val version = Integer.reverseBytes(
-                    input.readInt()
-                )
-
-                version in
-                    GGUF_VERSION_MIN..GGUF_VERSION_MAX
+                val version = Integer.reverseBytes(input.readInt())
+                version in GGUF_VERSION_MIN..GGUF_VERSION_MAX
             }
-
         } catch (_: Exception) {
-
             false
         }
     }
 
     private fun isCompleteModel(file: File): Boolean {
-
         return file.exists() &&
             file.isFile &&
             file.length() == EXPECTED_MODEL_SIZE &&
@@ -97,300 +91,320 @@ class ModelDownloader(context: Context) {
             hasValidGgufHeader(file)
     }
 
+    private fun restoreBackupIfNeeded(): Boolean {
+        if (!backupFile.exists()) {
+            return true
+        }
+
+        if (finalFile.exists()) {
+            return false
+        }
+
+        return backupFile.renameTo(finalFile)
+    }
+
     suspend fun download(
         onProgress: (Long, Long) -> Unit = { _, _ -> }
     ): File = withContext(Dispatchers.IO) {
 
-        if (
-            !modelDirectory.exists() &&
-            !modelDirectory.mkdirs()
-        ) {
-            throw IllegalStateException(
-                "ساخت پوشه مدل ناموفق بود."
-            )
-        }
-
-        // Keep an already complete model.
-        if (isCompleteModel(finalFile)) {
-            return@withContext finalFile
-        }
-
-        // Never overwrite an existing recovery backup.
-        if (backupFile.exists()) {
-            throw IllegalStateException(
-                "نسخه پشتیبان قبلی وجود دارد؛ ابتدا وضعیت آن را بررسی کن."
-            )
-        }
-
-        // Remove invalid or oversized partial downloads.
-        if (partialFile.exists()) {
+        ModelStorageCoordinator.downloadMutex.withLock {
 
             if (
-                !hasValidGgufHeader(partialFile) ||
-                partialFile.length() >= EXPECTED_MODEL_SIZE
-            ) {
-                partialFile.delete()
-            }
-        }
-
-        val existingSize = if (partialFile.exists()) {
-            partialFile.length()
-        } else {
-            0L
-        }
-
-        var connection: HttpURLConnection? = null
-
-        try {
-
-            connection = (URL(MODEL_URL).openConnection()
-                as HttpURLConnection).apply {
-
-                connectTimeout = CONNECT_TIMEOUT
-                readTimeout = READ_TIMEOUT
-                instanceFollowRedirects = true
-                requestMethod = "GET"
-
-                setRequestProperty(
-                    "User-Agent",
-                    "FARID-TECH-AI/1.0"
-                )
-
-                setRequestProperty(
-                    "Accept-Encoding",
-                    "identity"
-                )
-
-                if (existingSize > 0L) {
-
-                    setRequestProperty(
-                        "Range",
-                        "bytes=$existingSize-"
-                    )
-                }
-            }
-
-            val response = connection.responseCode
-
-            if (
-                response != HttpURLConnection.HTTP_OK &&
-                response != HttpURLConnection.HTTP_PARTIAL
+                !modelDirectory.exists() &&
+                !modelDirectory.mkdirs()
             ) {
                 throw IllegalStateException(
-                    "خطای دانلود از سرور: HTTP $response"
+                    "ساخت پوشه مدل ناموفق بود."
                 )
             }
 
-            val append =
-                response == HttpURLConnection.HTTP_PARTIAL
-
-            val startSize = if (append) {
-                existingSize
-            } else {
-                0L
+            if (isCompleteModel(finalFile)) {
+                return@withLock finalFile
             }
 
-            if (append) {
-
-                val contentRange =
-                    connection.getHeaderField("Content-Range")
-
-                val match = Regex(
-                    "^bytes (\\d+)-(\\d+)/(\\d+)$"
-                ).matchEntire(contentRange ?: "")
-
-                if (match == null) {
+            ModelStorageCoordinator.engineMutex.withLock {
+                if (!restoreBackupIfNeeded()) {
                     throw IllegalStateException(
-                        "پاسخ ادامه دانلود معتبر نیست."
-                    )
-                }
-
-                val rangeStart =
-                    match.groupValues[1].toLong()
-
-                val rangeEnd =
-                    match.groupValues[2].toLong()
-
-                val totalSize =
-                    match.groupValues[3].toLong()
-
-                val receivedRangeSize =
-                    rangeEnd - rangeStart + 1L
-
-                val responseBodySize =
-                    connection.contentLengthLong
-
-                if (
-                    rangeStart != existingSize ||
-                    rangeEnd < rangeStart ||
-                    totalSize != EXPECTED_MODEL_SIZE ||
-                    rangeEnd != totalSize - 1L ||
-                    receivedRangeSize <= 0L ||
-                    (
-                        responseBodySize >= 0L &&
-                        responseBodySize != receivedRangeSize
-                    )
-                ) {
-                    throw IllegalStateException(
-                        "محدوده دریافتی سرور با فایل مدل سازگار نیست."
-                    )
-                }
-
-            } else {
-
-                val responseSize =
-                    connection.contentLengthLong
-
-                if (
-                    responseSize >= 0L &&
-                    responseSize != EXPECTED_MODEL_SIZE
-                ) {
-                    throw IllegalStateException(
-                        "اندازه اعلام‌شده فایل با نسخه اصلی مدل مطابقت ندارد."
+                        "نسخه پشتیبان قبلی وجود دارد؛ وضعیت فایل‌ها نیاز به بررسی دارد."
                     )
                 }
             }
 
-            onProgress(
-                startSize,
-                EXPECTED_MODEL_SIZE
-            )
+            if (backupFile.exists()) {
+                throw IllegalStateException(
+                    "نسخه پشتیبان قبلی هنوز وجود دارد."
+                )
+            }
 
-            connection.inputStream.use { input ->
+            if (partialFile.exists()) {
+                if (
+                    !hasValidGgufHeader(partialFile) ||
+                    partialFile.length() >= EXPECTED_MODEL_SIZE
+                ) {
+                    if (!partialFile.delete()) {
+                        throw IllegalStateException(
+                            "حذف فایل موقت ناموفق بود."
+                        )
+                    }
+                }
+            }
 
-                RandomAccessFile(
-                    partialFile,
-                    "rw"
-                ).use { output ->
+            val existingSize =
+                if (partialFile.exists()) partialFile.length() else 0L
 
-                    if (!append) {
-                        output.setLength(0L)
+            var connection: HttpURLConnection? = null
+
+            try {
+                connection = (
+                    URL(MODEL_URL).openConnection()
+                        as HttpURLConnection
+                ).apply {
+                    connectTimeout = CONNECT_TIMEOUT
+                    readTimeout = READ_TIMEOUT
+                    instanceFollowRedirects = true
+                    requestMethod = "GET"
+
+                    setRequestProperty(
+                        "User-Agent",
+                        "FARID-TECH-AI/1.0"
+                    )
+
+                    setRequestProperty(
+                        "Accept-Encoding",
+                        "identity"
+                    )
+
+                    if (existingSize > 0L) {
+                        setRequestProperty(
+                            "Range",
+                            "bytes=$existingSize-"
+                        )
+                    }
+                }
+
+                val response = connection.responseCode
+
+                if (
+                    response != HttpURLConnection.HTTP_OK &&
+                    response != HttpURLConnection.HTTP_PARTIAL
+                ) {
+                    throw IllegalStateException(
+                        "خطای دانلود از سرور: HTTP $response"
+                    )
+                }
+
+                val append =
+                    response == HttpURLConnection.HTTP_PARTIAL
+
+                val startSize =
+                    if (append) existingSize else 0L
+
+                if (append) {
+                    val contentRange =
+                        connection.getHeaderField("Content-Range")
+
+                    val match = Regex(
+                        "^bytes (\\d+)-(\\d+)/(\\d+)$"
+                    ).matchEntire(contentRange ?: "")
+
+                    if (match == null) {
+                        throw IllegalStateException(
+                            "پاسخ ادامه دانلود معتبر نیست."
+                        )
                     }
 
-                    output.seek(startSize)
+                    val rangeStart =
+                        match.groupValues[1].toLong()
 
-                    val buffer = ByteArray(64 * 1024)
+                    val rangeEnd =
+                        match.groupValues[2].toLong()
 
-                    var downloaded = startSize
+                    val totalSize =
+                        match.groupValues[3].toLong()
 
-                    while (true) {
+                    val receivedRangeSize =
+                        rangeEnd - rangeStart + 1L
 
-                        val count = input.read(buffer)
+                    val responseBodySize =
+                        connection.contentLengthLong
 
-                        if (count == -1) {
-                            break
+                    if (
+                        rangeStart != existingSize ||
+                        rangeEnd < rangeStart ||
+                        totalSize != EXPECTED_MODEL_SIZE ||
+                        rangeEnd != totalSize - 1L ||
+                        receivedRangeSize <= 0L ||
+                        (
+                            responseBodySize >= 0L &&
+                            responseBodySize != receivedRangeSize
+                        )
+                    ) {
+                        throw IllegalStateException(
+                            "محدوده دریافتی سرور با فایل مدل سازگار نیست."
+                        )
+                    }
+                } else {
+                    val responseSize =
+                        connection.contentLengthLong
+
+                    if (
+                        responseSize >= 0L &&
+                        responseSize != EXPECTED_MODEL_SIZE
+                    ) {
+                        throw IllegalStateException(
+                            "اندازه فایل دریافتی با نسخه مورد انتظار مطابقت ندارد."
+                        )
+                    }
+                }
+
+                onProgress(startSize, EXPECTED_MODEL_SIZE)
+
+                connection.inputStream.use { input ->
+                    RandomAccessFile(
+                        partialFile,
+                        "rw"
+                    ).use { output ->
+
+                        if (!append) {
+                            output.setLength(0L)
                         }
 
-                        if (
-                            downloaded + count >
-                            EXPECTED_MODEL_SIZE
-                        ) {
-                            partialFile.delete()
+                        output.seek(startSize)
 
-                            throw IllegalStateException(
-                                "حجم دریافتی بیشتر از اندازه فایل اصلی است."
+                        val buffer = ByteArray(64 * 1024)
+                        var downloaded = startSize
+
+                        while (true) {
+                            val count = input.read(buffer)
+
+                            if (count == -1) {
+                                break
+                            }
+
+                            if (
+                                downloaded + count >
+                                EXPECTED_MODEL_SIZE
+                            ) {
+                                throw IllegalStateException(
+                                    "حجم دریافتی بیشتر از اندازه فایل اصلی است."
+                                )
+                            }
+
+                            output.write(buffer, 0, count)
+                            downloaded += count
+
+                            onProgress(
+                                downloaded,
+                                EXPECTED_MODEL_SIZE
                             )
                         }
 
-                        output.write(
-                            buffer,
-                            0,
-                            count
-                        )
+                        output.fd.sync()
+                    }
+                }
 
-                        downloaded += count
+                if (
+                    partialFile.length() != EXPECTED_MODEL_SIZE
+                ) {
+                    throw IllegalStateException(
+                        "دانلود ناقص است؛ فایل موقت برای ادامه دانلود حفظ شد."
+                    )
+                }
 
-                        onProgress(
-                            downloaded,
-                            EXPECTED_MODEL_SIZE
-                        )
+                if (
+                    partialFile.length() < MIN_MODEL_SIZE ||
+                    !hasValidGgufHeader(partialFile)
+                ) {
+                    partialFile.delete()
+
+                    throw IllegalStateException(
+                        "فایل دانلودشده معتبر نیست."
+                    )
+                }
+
+                val installedFile =
+                    ModelStorageCoordinator.engineMutex.withLock {
+
+                        if (isCompleteModel(finalFile)) {
+                            partialFile.delete()
+                            return@withLock finalFile
+                        }
+
+                        if (backupFile.exists()) {
+                            throw IllegalStateException(
+                                "نسخه پشتیبان قبلی وجود دارد."
+                            )
+                        }
+
+                        var oldFileMoved = false
+                        var newFileInstalled = false
+
+                        try {
+                            if (finalFile.exists()) {
+                                if (!finalFile.renameTo(backupFile)) {
+                                    throw IllegalStateException(
+                                        "نگهداری نسخه قبلی مدل ناموفق بود."
+                                    )
+                                }
+                                oldFileMoved = true
+                            }
+
+                            if (!partialFile.renameTo(finalFile)) {
+                                throw IllegalStateException(
+                                    "انتقال فایل مدل ناموفق بود."
+                                )
+                            }
+
+                            newFileInstalled = true
+
+                            if (!isCompleteModel(finalFile)) {
+                                throw IllegalStateException(
+                                    "اعتبارسنجی فایل نهایی ناموفق بود."
+                                )
+                            }
+
+                            if (
+                                oldFileMoved &&
+                                backupFile.exists() &&
+                                !backupFile.delete()
+                            ) {
+                                throw IllegalStateException(
+                                    "حذف نسخه پشتیبان انجام نشد."
+                                )
+                            }
+
+                            finalFile
+
+                        } catch (e: Exception) {
+                            if (
+                                newFileInstalled &&
+                                finalFile.exists()
+                            ) {
+                                finalFile.delete()
+                            }
+
+                            if (
+                                oldFileMoved &&
+                                backupFile.exists() &&
+                                !finalFile.exists()
+                            ) {
+                                backupFile.renameTo(finalFile)
+                            }
+
+                            throw e
+                        }
                     }
 
-                    output.fd.sync()
-                }
-            }
-
-            // Verify exact file size.
-            if (
-                partialFile.length() != EXPECTED_MODEL_SIZE
-            ) {
-                throw IllegalStateException(
-                    "دانلود ناقص است؛ فایل موقت برای ادامه دانلود حفظ شد."
+                onProgress(
+                    EXPECTED_MODEL_SIZE,
+                    EXPECTED_MODEL_SIZE
                 )
+
+                installedFile
+
+            } finally {
+                connection?.disconnect()
             }
-
-            if (partialFile.length() < MIN_MODEL_SIZE) {
-
-                partialFile.delete()
-
-                throw IllegalStateException(
-                    "حجم فایل مدل کمتر از حد مجاز است."
-                )
-            }
-
-            // Validate GGUF header and version.
-            if (!hasValidGgufHeader(partialFile)) {
-
-                partialFile.delete()
-
-                throw IllegalStateException(
-                    "فایل دریافتی قالب GGUF معتبر ندارد."
-                )
-            }
-
-            // Preserve the old file until installation succeeds.
-            val hadOldFile = finalFile.exists()
-
-            if (
-                hadOldFile &&
-                !finalFile.renameTo(backupFile)
-            ) {
-                throw IllegalStateException(
-                    "نگهداری نسخه قبلی مدل ناموفق بود."
-                )
-            }
-
-            // Install the downloaded model.
-            if (!partialFile.renameTo(finalFile)) {
-
-                if (hadOldFile) {
-                    backupFile.renameTo(finalFile)
-                }
-
-                throw IllegalStateException(
-                    "انتقال فایل مدل ناموفق بود."
-                )
-            }
-
-            // Validate the installed file.
-            if (!isCompleteModel(finalFile)) {
-
-                finalFile.delete()
-
-                if (hadOldFile) {
-                    backupFile.renameTo(finalFile)
-                }
-
-                throw IllegalStateException(
-                    "اعتبارسنجی فایل نهایی ناموفق بود."
-                )
-            }
-
-            // Remove the old backup only after successful installation.
-            if (backupFile.exists()) {
-                backupFile.delete()
-            }
-
-            onProgress(
-                EXPECTED_MODEL_SIZE,
-                EXPECTED_MODEL_SIZE
-            )
-
-            finalFile
-
-        } finally {
-
-            connection?.disconnect()
         }
     }
 }
