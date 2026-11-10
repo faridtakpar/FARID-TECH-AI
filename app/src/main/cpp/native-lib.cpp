@@ -20,8 +20,108 @@ llama_context* context = nullptr;
 
 bool backendInitialized = false;
 
+
+// Convert Java UTF-16 string to standard UTF-8.
+bool jstringToUtf8(
+    JNIEnv* env,
+    jstring value,
+    std::string& output
+) {
+    const jchar* chars =
+        env->GetStringChars(value, nullptr);
+
+    if (chars == nullptr) {
+        return false;
+    }
+
+    const jsize length =
+        env->GetStringLength(value);
+
+    output.clear();
+
+    for (jsize i = 0; i < length; ++i) {
+
+        uint32_t cp = chars[i];
+
+        if (cp >= 0xD800 && cp <= 0xDBFF) {
+
+            if (
+                i + 1 < length &&
+                chars[i + 1] >= 0xDC00 &&
+                chars[i + 1] <= 0xDFFF
+            ) {
+                cp = 0x10000 +
+                    ((cp - 0xD800) << 10) +
+                    (chars[++i] - 0xDC00);
+            } else {
+                cp = 0xFFFD;
+            }
+
+        } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+
+            cp = 0xFFFD;
+        }
+
+        if (cp <= 0x7F) {
+
+            output.push_back(
+                static_cast<char>(cp)
+            );
+
+        } else if (cp <= 0x7FF) {
+
+            output.push_back(
+                static_cast<char>(0xC0 | (cp >> 6))
+            );
+
+            output.push_back(
+                static_cast<char>(0x80 | (cp & 0x3F))
+            );
+
+        } else if (cp <= 0xFFFF) {
+
+            output.push_back(
+                static_cast<char>(0xE0 | (cp >> 12))
+            );
+
+            output.push_back(
+                static_cast<char>(0x80 | ((cp >> 6) & 0x3F))
+            );
+
+            output.push_back(
+                static_cast<char>(0x80 | (cp & 0x3F))
+            );
+
+        } else {
+
+            output.push_back(
+                static_cast<char>(0xF0 | (cp >> 18))
+            );
+
+            output.push_back(
+                static_cast<char>(0x80 | ((cp >> 12) & 0x3F))
+            );
+
+            output.push_back(
+                static_cast<char>(0x80 | ((cp >> 6) & 0x3F))
+            );
+
+            output.push_back(
+                static_cast<char>(0x80 | (cp & 0x3F))
+            );
+        }
+    }
+
+    env->ReleaseStringChars(value, chars);
+
+    return true;
+}
+
+
 // Convert UTF-8 into UTF-16 for Android JNI.
-std::u16string utf8ToUtf16(const std::string& input) {
+std::u16string utf8ToUtf16(
+    const std::string& input
+) {
 
     std::u16string output;
 
@@ -30,29 +130,40 @@ std::u16string utf8ToUtf16(const std::string& input) {
     while (i < input.size()) {
 
         uint32_t codePoint = 0;
+
         unsigned char c =
             static_cast<unsigned char>(input[i]);
 
         size_t extra = 0;
 
         if (c <= 0x7F) {
+
             codePoint = c;
+
         } else if (c >= 0xC2 && c <= 0xDF) {
+
             codePoint = c & 0x1F;
             extra = 1;
+
         } else if (c >= 0xE0 && c <= 0xEF) {
+
             codePoint = c & 0x0F;
             extra = 2;
+
         } else if (c >= 0xF0 && c <= 0xF4) {
+
             codePoint = c & 0x07;
             extra = 3;
+
         } else {
+
             output.push_back(u'\uFFFD');
             ++i;
             continue;
         }
 
         if (i + extra >= input.size()) {
+
             output.push_back(u'\uFFFD');
             break;
         }
@@ -62,18 +173,23 @@ std::u16string utf8ToUtf16(const std::string& input) {
         for (size_t j = 1; j <= extra; ++j) {
 
             unsigned char next =
-                static_cast<unsigned char>(input[i + j]);
+                static_cast<unsigned char>(
+                    input[i + j]
+                );
 
             if ((next & 0xC0) != 0x80) {
+
                 valid = false;
                 break;
             }
 
             codePoint =
-                (codePoint << 6) | (next & 0x3F);
+                (codePoint << 6) |
+                (next & 0x3F);
         }
 
         if (!valid) {
+
             output.push_back(u'\uFFFD');
             ++i;
             continue;
@@ -86,6 +202,7 @@ std::u16string utf8ToUtf16(const std::string& input) {
             codePoint > 0x10FFFF ||
             (codePoint >= 0xD800 && codePoint <= 0xDFFF)
         ) {
+
             output.push_back(u'\uFFFD');
             i += extra + 1;
             continue;
@@ -120,6 +237,8 @@ std::u16string utf8ToUtf16(const std::string& input) {
     return output;
 }
 
+
+// Create Java string from UTF-8.
 jstring makeResult(
     JNIEnv* env,
     const std::string& value
@@ -132,10 +251,14 @@ jstring makeResult(
         reinterpret_cast<const jchar*>(
             converted.data()
         ),
-        static_cast<jsize>(converted.size())
+        static_cast<jsize>(
+            converted.size()
+        )
     );
 }
 
+
+// Return Persian error message.
 jstring makeError(
     JNIEnv* env,
     const std::string& message
@@ -147,6 +270,8 @@ jstring makeError(
     );
 }
 
+
+// Release model and context.
 void releaseModelLocked() {
 
     if (context != nullptr) {
@@ -162,6 +287,8 @@ void releaseModelLocked() {
     }
 }
 
+
+// Decode token batch.
 bool decodeBatch(
     llama_context* ctx,
     llama_batch batch
@@ -176,6 +303,10 @@ bool decodeBatch(
 } // namespace
 
 
+// --------------------------------------------------
+// Native bridge check
+// --------------------------------------------------
+
 extern "C"
 JNIEXPORT jstring JNICALL
 Java_com_faridtech_ai_NativeLlama_nativeBridgeCheck(
@@ -189,6 +320,10 @@ Java_com_faridtech_ai_NativeLlama_nativeBridgeCheck(
     );
 }
 
+
+// --------------------------------------------------
+// Load GGUF model
+// --------------------------------------------------
 
 extern "C"
 JNIEXPORT jstring JNICALL
@@ -206,13 +341,9 @@ Java_com_faridtech_ai_NativeLlama_nativeLoadModel(
         );
     }
 
-    const char* pathChars =
-        env->GetStringUTFChars(
-            modelPath,
-            nullptr
-        );
+    std::string path;
 
-    if (pathChars == nullptr) {
+    if (!jstringToUtf8(env, modelPath, path)) {
 
         return makeError(
             env,
@@ -220,12 +351,13 @@ Java_com_faridtech_ai_NativeLlama_nativeLoadModel(
         );
     }
 
-    std::string path(pathChars);
+    if (path.empty()) {
 
-    env->ReleaseStringUTFChars(
-        modelPath,
-        pathChars
-    );
+        return makeError(
+            env,
+            "مسیر مدل خالی است."
+        );
+    }
 
     std::lock_guard<std::mutex> lock(engineMutex);
 
@@ -282,7 +414,7 @@ Java_com_faridtech_ai_NativeLlama_nativeLoadModel(
             );
         }
 
-        // Keep the old model until the new one is ready.
+        // Replace previous model only after successful loading.
         releaseModelLocked();
 
         model = newModel;
@@ -310,6 +442,10 @@ Java_com_faridtech_ai_NativeLlama_nativeLoadModel(
 }
 
 
+// --------------------------------------------------
+// Generate AI response
+// --------------------------------------------------
+
 extern "C"
 JNIEXPORT jstring JNICALL
 Java_com_faridtech_ai_NativeLlama_nativeGenerate(
@@ -327,26 +463,15 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
         );
     }
 
-    const char* promptChars =
-        env->GetStringUTFChars(
-            promptText,
-            nullptr
-        );
+    std::string prompt;
 
-    if (promptChars == nullptr) {
+    if (!jstringToUtf8(env, promptText, prompt)) {
 
         return makeError(
             env,
             "خواندن پیام ناموفق بود."
         );
     }
-
-    std::string prompt(promptChars);
-
-    env->ReleaseStringUTFChars(
-        promptText,
-        promptChars
-    );
 
     if (prompt.empty()) {
 
@@ -404,6 +529,7 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
             );
         }
 
+        // Allocate token buffer.
         std::vector<llama_token> tokens(
             prompt.size() + 16
         );
@@ -412,9 +538,13 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
             llama_tokenize(
                 vocab,
                 prompt.c_str(),
-                static_cast<int32_t>(prompt.size()),
+                static_cast<int32_t>(
+                    prompt.size()
+                ),
                 tokens.data(),
-                static_cast<int32_t>(tokens.size()),
+                static_cast<int32_t>(
+                    tokens.size()
+                ),
                 true,
                 true
             );
@@ -427,6 +557,7 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
             );
         }
 
+        // Resize buffer if needed.
         if (tokenCount < 0) {
 
             const int32_t required =
@@ -436,15 +567,18 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
                 static_cast<size_t>(required)
             );
 
-            tokenCount = llama_tokenize(
-                vocab,
-                prompt.c_str(),
-                static_cast<int32_t>(prompt.size()),
-                tokens.data(),
-                required,
-                true,
-                true
-            );
+            tokenCount =
+                llama_tokenize(
+                    vocab,
+                    prompt.c_str(),
+                    static_cast<int32_t>(
+                        prompt.size()
+                    ),
+                    tokens.data(),
+                    required,
+                    true,
+                    true
+                );
         }
 
         if (tokenCount <= 0) {
@@ -483,7 +617,7 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
             );
         }
 
-        // Process the prompt in batches.
+        // Process prompt in batches.
         for (
             size_t offset = 0;
             offset < tokens.size();
@@ -521,7 +655,9 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
             llama_sampler,
             decltype(&llama_sampler_free)
         > sampler(
-            llama_sampler_chain_init(samplerParams),
+            llama_sampler_chain_init(
+                samplerParams
+            ),
             &llama_sampler_free
         );
 
@@ -548,6 +684,7 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
                 return true;
             };
 
+        // Top-K.
         if (!addSampler(
             llama_sampler_init_top_k(40)
         )) {
@@ -558,6 +695,7 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
             );
         }
 
+        // Top-P.
         if (!addSampler(
             llama_sampler_init_top_p(0.90f, 1)
         )) {
@@ -568,6 +706,7 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
             );
         }
 
+        // Temperature.
         if (!addSampler(
             llama_sampler_init_temp(0.70f)
         )) {
@@ -578,8 +717,11 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
             );
         }
 
+        // Random distribution.
         if (!addSampler(
-            llama_sampler_init_dist(LLAMA_DEFAULT_SEED)
+            llama_sampler_init_dist(
+                LLAMA_DEFAULT_SEED
+            )
         )) {
 
             return makeError(
@@ -590,25 +732,32 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
 
         std::string output;
 
-        const int limit = std::max(
-            1,
-            std::min(
-                static_cast<int>(maxTokens),
-                512
-            )
-        );
+        const int limit =
+            std::max(
+                1,
+                std::min(
+                    static_cast<int>(maxTokens),
+                    512
+                )
+            );
 
+        // Generate tokens.
         for (int i = 0; i < limit; ++i) {
 
             // Sample from the last token logits.
-            const llama_token newToken =
+            llama_token newToken =
                 llama_sampler_sample(
                     sampler.get(),
                     context,
                     -1
                 );
 
-            if (llama_vocab_is_eog(vocab, newToken)) {
+            if (
+                llama_vocab_is_eog(
+                    vocab,
+                    newToken
+                )
+            ) {
                 break;
             }
 
@@ -636,7 +785,9 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
 
                 const size_t required =
                     static_cast<size_t>(
-                        -static_cast<int64_t>(pieceLength)
+                        -static_cast<int64_t>(
+                            pieceLength
+                        )
                     );
 
                 if (
@@ -676,14 +827,18 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
 
                 output.append(
                     largeBuffer.data(),
-                    static_cast<size_t>(pieceLength)
+                    static_cast<size_t>(
+                        pieceLength
+                    )
                 );
 
             } else if (pieceLength > 0) {
 
                 output.append(
                     piece,
-                    static_cast<size_t>(pieceLength)
+                    static_cast<size_t>(
+                        pieceLength
+                    )
                 );
             }
 
@@ -698,7 +853,7 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
             // Evaluate sampled token for next generation.
             llama_batch nextBatch =
                 llama_batch_get_one(
-                    const_cast<llama_token*>(&newToken),
+                    &newToken,
                     1
                 );
 
@@ -740,6 +895,10 @@ Java_com_faridtech_ai_NativeLlama_nativeGenerate(
     }
 }
 
+
+// --------------------------------------------------
+// Release native model
+// --------------------------------------------------
 
 extern "C"
 JNIEXPORT void JNICALL
