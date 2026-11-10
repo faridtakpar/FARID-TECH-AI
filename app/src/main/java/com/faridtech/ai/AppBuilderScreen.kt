@@ -44,6 +44,7 @@ fun AppBuilderScreen(
     var selectedFile by remember { mutableStateOf<File?>(null) }
 
     var editorText by remember { mutableStateOf("") }
+
     var entries by remember {
         mutableStateOf<List<ProjectTreeEntry>>(emptyList())
     }
@@ -78,20 +79,49 @@ fun AppBuilderScreen(
 
     fun isInsideProject(file: File, root: File): Boolean {
         return try {
-            file.canonicalFile.toPath()
-                .startsWith(root.canonicalFile.toPath())
+            val targetPath = file.canonicalFile.toPath()
+            val rootPath = root.canonicalFile.toPath()
+            targetPath.startsWith(rootPath)
         } catch (_: Exception) {
             false
         }
     }
 
+    fun isSameOrInside(file: File, parent: File): Boolean {
+        return try {
+            val filePath = file.canonicalFile.toPath()
+            val parentPath = parent.canonicalFile.toPath()
+            filePath.startsWith(parentPath)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun validItemName(name: String): Boolean {
+        return name.isNotBlank() &&
+            name != "." &&
+            name != ".." &&
+            !name.startsWith(".") &&
+            !name.contains("/") &&
+            !name.contains("\\") &&
+            !name.contains(":") &&
+            name.matches(Regex("[\\p{L}\\p{N}_. -]+"))
+    }
+
     suspend fun scanProject(root: File): List<ProjectTreeEntry> {
         return withContext(Dispatchers.IO) {
             val result = mutableListOf<ProjectTreeEntry>()
+            val canonicalRoot = root.canonicalFile
 
             fun scan(directory: File, depth: Int) {
+                if (depth > 12) return
+
                 val children = directory.listFiles()
-                    ?.filter { !it.name.startsWith(".") }
+                    ?.filter { child ->
+                        !child.name.startsWith(".") &&
+                            child.name !in setOf("build", ".gradle") &&
+                            isInsideProject(child, canonicalRoot)
+                    }
                     ?.sortedWith(
                         compareBy<File> { !it.isDirectory }
                             .thenBy { it.name.lowercase() }
@@ -107,14 +137,41 @@ fun AppBuilderScreen(
                 }
             }
 
-            scan(root, 0)
+            scan(canonicalRoot, 0)
             result
         }
     }
 
-    // بازکردن پروژه‌ای که از کتابخانه انتخاب شده است
+    suspend fun saveProjectMetadata(root: File) {
+        val name = projectName
+        val packageId = packageName
+        val projectLanguage = language
+
+        withContext(Dispatchers.IO) {
+            check(
+                ProjectMetadataStore.save(
+                    projectDirectory = root,
+                    name = name,
+                    packageName = packageId,
+                    language = projectLanguage
+                )
+            ) {
+                "ذخیره اطلاعات پروژه ناموفق بود."
+            }
+
+            root.setLastModified(System.currentTimeMillis())
+        }
+    }
+
+    suspend fun refreshProject(root: File) {
+        entries = scanProject(root)
+    }
+
+    // بازیابی پروژه انتخاب‌شده از کتابخانه
     LaunchedEffect(initialProject) {
         val folder = initialProject ?: return@LaunchedEffect
+
+        loading = true
 
         try {
             val projectsRoot = withContext(Dispatchers.IO) {
@@ -125,26 +182,50 @@ fun AppBuilderScreen(
                 folder.canonicalFile
             }
 
-            if (
-                !validFolder.isDirectory ||
-                !validFolder.toPath().startsWith(projectsRoot.toPath())
-            ) {
+            val valid = withContext(Dispatchers.IO) {
+                validFolder.isDirectory &&
+                    validFolder.toPath().startsWith(
+                        projectsRoot.toPath()
+                    ) &&
+                    validFolder != projectsRoot
+            }
+
+            if (!valid) {
                 error = "مسیر پروژه معتبر نیست."
                 return@LaunchedEffect
             }
 
+            val metadata = withContext(Dispatchers.IO) {
+                ProjectMetadataStore.load(validFolder)
+            }
+
             projectFolder = validFolder
             currentDirectory = validFolder
-            projectName = validFolder.name
+
+            projectName = metadata?.name
+                ?.takeIf { it.isNotBlank() }
+                ?: validFolder.name
+
+            packageName = metadata?.packageName
+                ?.takeIf { it.isNotBlank() }
+                ?: "com.example.myapp"
+
+            language = metadata?.language
+                ?.takeIf { it.isNotBlank() }
+                ?: "Kotlin"
+
             selectedFile = null
             editorText = ""
+
             entries = scanProject(validFolder)
 
-            message = "پروژه قبلی با موفقیت باز شد."
+            message = "پروژه با موفقیت باز شد."
             error = ""
 
-        } catch (_: Exception) {
-            error = "بازکردن پروژه ناموفق بود."
+        } catch (e: Exception) {
+            error = e.message ?: "بازکردن پروژه ناموفق بود."
+        } finally {
+            loading = false
         }
     }
 
@@ -171,6 +252,7 @@ fun AppBuilderScreen(
                 editorText = content
                 error = ""
                 message = ""
+
             } catch (_: Exception) {
                 error = "خواندن فایل ناموفق بود."
             }
@@ -180,22 +262,37 @@ fun AppBuilderScreen(
     fun saveFile() {
         val file = selectedFile ?: return
         val root = projectFolder ?: return
+        val content = editorText
 
         if (!isInsideProject(file, root)) {
             error = "مسیر فایل معتبر نیست."
             return
         }
 
+        if (!file.isFile || !isEditable(file)) {
+            error = "ذخیره این نوع فایل مجاز نیست."
+            return
+        }
+
+        if (loading) return
+        loading = true
+
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    file.writeText(editorText)
+                    file.writeText(content)
                 }
 
-                message = "تغییرات فایل ذخیره شد."
+                saveProjectMetadata(root)
+                refreshProject(root)
+
+                message = "فایل و اطلاعات آخرین ویرایش ذخیره شدند."
                 error = ""
-            } catch (_: Exception) {
-                error = "ذخیره فایل ناموفق بود."
+
+            } catch (e: Exception) {
+                error = e.message ?: "ذخیره فایل ناموفق بود."
+            } finally {
+                loading = false
             }
         }
     }
@@ -210,6 +307,8 @@ fun AppBuilderScreen(
             error = "شناسه بسته معتبر نیست."
             return
         }
+
+        if (loading) return
 
         loading = true
         error = ""
@@ -231,9 +330,10 @@ fun AppBuilderScreen(
                 selectedFile = null
                 editorText = ""
 
-                entries = scanProject(folder)
+                saveProjectMetadata(folder)
+                refreshProject(folder)
 
-                message = "پروژه با قالب استاندارد ساخته شد."
+                message = "پروژه با موفقیت ساخته و اطلاعات آن ذخیره شد."
 
             } catch (e: Exception) {
                 error = e.message ?: "ساخت پروژه ناموفق بود."
@@ -248,20 +348,12 @@ fun AppBuilderScreen(
         val parent = currentDirectory ?: root
         val name = newItemName.trim()
 
-        if (!isInsideProject(parent, root)) {
+        if (!isInsideProject(parent, root) || !parent.isDirectory) {
             error = "مسیر پوشه معتبر نیست."
             return
         }
 
-        if (
-            name.isBlank() ||
-            name.contains("/") ||
-            name.contains("\\") ||
-            name == "." ||
-            name == ".." ||
-            name.startsWith(".") ||
-            !name.matches(Regex("[a-zA-Z0-9_.-]+"))
-        ) {
+        if (!validItemName(name)) {
             error = "نام فایل یا پوشه معتبر نیست."
             return
         }
@@ -273,23 +365,32 @@ fun AppBuilderScreen(
             return
         }
 
+        if (loading) return
+        loading = true
+
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    val success = if (newItemIsFolder) {
-                        target.mkdirs()
-                    } else {
-                        target.createNewFile()
-                    }
-
-                    check(success) {
+                    check(
+                        if (newItemIsFolder) {
+                            target.mkdirs()
+                        } else {
+                            target.createNewFile()
+                        }
+                    ) {
                         "ساخت فایل یا پوشه ناموفق بود."
                     }
                 }
 
-                entries = scanProject(root)
-                newItemName = ""
+                saveProjectMetadata(root)
+                refreshProject(root)
 
+                if (!newItemIsFolder && isEditable(target)) {
+                    selectedFile = target
+                    editorText = ""
+                }
+
+                newItemName = ""
                 message = if (newItemIsFolder) {
                     "پوشه جدید ساخته شد."
                 } else {
@@ -298,13 +399,10 @@ fun AppBuilderScreen(
 
                 error = ""
 
-                if (!newItemIsFolder && isEditable(target)) {
-                    selectedFile = target
-                    editorText = ""
-                }
-
             } catch (e: Exception) {
-                error = e.message ?: "عملیات ناموفق بود."
+                error = e.message ?: "ساخت فایل یا پوشه ناموفق بود."
+            } finally {
+                loading = false
             }
         }
     }
@@ -314,21 +412,16 @@ fun AppBuilderScreen(
         val target = dialogTarget ?: return
         val newName = renameValue.trim()
 
-        if (!isInsideProject(target, root)) {
-            error = "مسیر موردنظر معتبر نیست."
+        if (
+            !isInsideProject(target, root) ||
+            target.canonicalFile == root.canonicalFile
+        ) {
+            error = "تغییر نام این مسیر مجاز نیست."
             showRenameDialog = false
             return
         }
 
-        if (
-            newName.isBlank() ||
-            newName.contains("/") ||
-            newName.contains("\\") ||
-            newName == "." ||
-            newName == ".." ||
-            newName.startsWith(".") ||
-            !newName.matches(Regex("[a-zA-Z0-9_.-]+"))
-        ) {
+        if (!validItemName(newName)) {
             error = "نام جدید معتبر نیست."
             return
         }
@@ -340,22 +433,46 @@ fun AppBuilderScreen(
             return
         }
 
+        if (loading) return
+        loading = true
+
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
+                    check(isInsideProject(target, root)) {
+                        "مسیر موردنظر معتبر نیست."
+                    }
+
                     check(target.renameTo(destination)) {
                         "تغییر نام انجام نشد."
                     }
                 }
 
-                selectedFile = null
-                editorText = ""
-
-                currentDirectory = currentDirectory?.let {
-                    if (it == target) destination else it
+                // حفظ مسیر فایل یا پوشه انتخاب‌شده پس از تغییر نام
+                selectedFile = selectedFile?.let { selected ->
+                    if (isSameOrInside(selected, target)) {
+                        File(
+                            destination,
+                            selected.relativeTo(target).path
+                        )
+                    } else {
+                        selected
+                    }
                 }
 
-                entries = scanProject(root)
+                currentDirectory = currentDirectory?.let { current ->
+                    if (isSameOrInside(current, target)) {
+                        File(
+                            destination,
+                            current.relativeTo(target).path
+                        )
+                    } else {
+                        current
+                    }
+                }
+
+                saveProjectMetadata(root)
+                refreshProject(root)
 
                 showRenameDialog = false
                 dialogTarget = null
@@ -364,6 +481,8 @@ fun AppBuilderScreen(
 
             } catch (e: Exception) {
                 error = e.message ?: "تغییر نام ناموفق بود."
+            } finally {
+                loading = false
             }
         }
     }
@@ -372,37 +491,47 @@ fun AppBuilderScreen(
         val root = projectFolder ?: return
         val target = dialogTarget ?: return
 
-        if (!isInsideProject(target, root)) {
+        if (
+            !isInsideProject(target, root) ||
+            target.canonicalFile == root.canonicalFile
+        ) {
             error = "حذف این مسیر مجاز نیست."
             showDeleteDialog = false
             return
         }
 
+        if (loading) return
+        loading = true
+
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
+                    check(isInsideProject(target, root)) {
+                        "مسیر موردنظر معتبر نیست."
+                    }
+
                     check(target.deleteRecursively()) {
                         "حذف فایل یا پوشه ناموفق بود."
                     }
                 }
 
-                selectedFile = null
-                editorText = ""
-
-                val directory = currentDirectory
+                if (
+                    selectedFile != null &&
+                    isSameOrInside(selectedFile!!, target)
+                ) {
+                    selectedFile = null
+                    editorText = ""
+                }
 
                 if (
-                    directory != null &&
-                    isInsideProject(directory, root) &&
-                    (
-                        directory == target ||
-                        directory.toPath().startsWith(target.toPath())
-                    )
+                    currentDirectory != null &&
+                    isSameOrInside(currentDirectory!!, target)
                 ) {
                     currentDirectory = root
                 }
 
-                entries = scanProject(root)
+                saveProjectMetadata(root)
+                refreshProject(root)
 
                 showDeleteDialog = false
                 dialogTarget = null
@@ -411,6 +540,8 @@ fun AppBuilderScreen(
 
             } catch (e: Exception) {
                 error = e.message ?: "حذف انجام نشد."
+            } finally {
+                loading = false
             }
         }
     }
@@ -599,7 +730,7 @@ fun AppBuilderScreen(
 
                         if (
                             parent != null &&
-                            (parent == root || isInsideProject(parent, root))
+                            isInsideProject(parent, root)
                         ) {
                             currentDirectory = parent
                             selectedFile = null
@@ -683,7 +814,8 @@ fun AppBuilderScreen(
                                     renameValue = file.name
                                     showRenameDialog = true
                                     error = ""
-                                }
+                                },
+                                enabled = !loading
                             ) {
                                 Text("تغییر نام")
                             }
@@ -693,7 +825,8 @@ fun AppBuilderScreen(
                                     dialogTarget = file
                                     showDeleteDialog = true
                                     error = ""
-                                }
+                                },
+                                enabled = !loading
                             ) {
                                 Text(
                                     "حذف",
@@ -760,7 +893,8 @@ fun AppBuilderScreen(
 
             Button(
                 onClick = { createItem() },
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !loading
             ) {
                 Text("＋ ایجاد")
             }
@@ -806,7 +940,7 @@ fun AppBuilderScreen(
 
             Button(
                 onClick = { saveFile() },
-                enabled = selectedFile != null,
+                enabled = selectedFile != null && !loading,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(50.dp)
@@ -856,29 +990,46 @@ fun AppBuilderScreen(
     if (showRenameDialog && dialogTarget != null) {
         AlertDialog(
             onDismissRequest = {
-                showRenameDialog = false
-                dialogTarget = null
+                if (!loading) {
+                    showRenameDialog = false
+                    dialogTarget = null
+                }
             },
             title = { Text("تغییر نام") },
             text = {
-                OutlinedTextField(
-                    value = renameValue,
-                    onValueChange = { renameValue = it },
-                    label = { Text("نام جدید") },
-                    singleLine = true
-                )
+                Column {
+                    OutlinedTextField(
+                        value = renameValue,
+                        onValueChange = { renameValue = it },
+                        label = { Text("نام جدید") },
+                        singleLine = true
+                    )
+
+                    if (error.isNotEmpty()) {
+                        Text(
+                            error,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
             },
             confirmButton = {
-                TextButton(onClick = { renameItem() }) {
+                TextButton(
+                    onClick = { renameItem() },
+                    enabled = !loading
+                ) {
                     Text("ذخیره")
                 }
             },
             dismissButton = {
                 TextButton(
                     onClick = {
-                        showRenameDialog = false
-                        dialogTarget = null
-                    }
+                        if (!loading) {
+                            showRenameDialog = false
+                            dialogTarget = null
+                        }
+                    },
+                    enabled = !loading
                 ) {
                     Text("انصراف")
                 }
@@ -889,8 +1040,10 @@ fun AppBuilderScreen(
     if (showDeleteDialog && dialogTarget != null) {
         AlertDialog(
             onDismissRequest = {
-                showDeleteDialog = false
-                dialogTarget = null
+                if (!loading) {
+                    showDeleteDialog = false
+                    dialogTarget = null
+                }
             },
             title = { Text("تأیید حذف") },
             text = {
@@ -899,7 +1052,10 @@ fun AppBuilderScreen(
                 )
             },
             confirmButton = {
-                TextButton(onClick = { deleteItem() }) {
+                TextButton(
+                    onClick = { deleteItem() },
+                    enabled = !loading
+                ) {
                     Text(
                         "حذف",
                         color = MaterialTheme.colorScheme.error
@@ -909,9 +1065,12 @@ fun AppBuilderScreen(
             dismissButton = {
                 TextButton(
                     onClick = {
-                        showDeleteDialog = false
-                        dialogTarget = null
-                    }
+                        if (!loading) {
+                            showDeleteDialog = false
+                            dialogTarget = null
+                        }
+                    },
+                    enabled = !loading
                 ) {
                     Text("انصراف")
                 }
