@@ -265,7 +265,14 @@ private fun OwnerLoginScreen(
             modifier = Modifier
                 .size(76.dp)
                 .clip(RoundedCornerShape(24.dp))
-                .background(BrandGreen),
+                .background(
+                    Brush.linearGradient(
+                        listOf(
+                            Color(0xFF19C37D),
+                            Color(0xFF087D53)
+                        )
+                    )
+                ),
             contentAlignment = Alignment.Center
         ) {
             Text(
@@ -375,23 +382,34 @@ fun OwnerDashboard(
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 18.dp, vertical = 16.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp)
+        verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {
+
+        // Header
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Box(
                 modifier = Modifier
-                    .size(46.dp)
-                    .clip(RoundedCornerShape(15.dp))
-                    .background(BrandGreen),
+                    .size(48.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(
+                        Brush.linearGradient(
+                            listOf(
+                                Color(0xFF19C37D),
+                                Color(0xFF087D53)
+                            )
+                        )
+                    ),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
                     "FT",
                     color = Color.White,
-                    fontWeight = FontWeight.Bold
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.titleLarge
                 )
             }
 
@@ -403,6 +421,7 @@ fun OwnerDashboard(
                     fontWeight = FontWeight.Bold,
                     style = MaterialTheme.typography.titleMedium
                 )
+
                 Text(
                     "دستیار هوشمند شخصی",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -410,95 +429,157 @@ fun OwnerDashboard(
                 )
             }
 
-            TextButton(onClick = onToggleTheme) {
-                Text(if (darkTheme) "☀️" else "🌙")
+            IconButton(onClick = onToggleTheme) {
+                Text(
+                    if (darkTheme) "☀️" else "🌙",
+                    style = MaterialTheme.typography.titleLarge
+                )
             }
 
-            TextButton(onClick = onLock) {
-                Text("🔒")
+            IconButton(onClick = onLock) {
+                Text(
+                    "🔒",
+                    style = MaterialTheme.typography.titleLarge
+                )
             }
         }
+
+        // Welcome banner
 
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(24.dp))
+                .clip(RoundedCornerShape(26.dp))
                 .background(
                     Brush.linearGradient(
                         listOf(
                             Color(0xFF126B4C),
-                            Color(0xFF173D36),
+                            Color(0xFF174A3D),
                             Color(0xFF202A35)
                         )
                     )
                 )
                 .padding(22.dp)
         ) {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
                 Text(
-                    "سلام، خوش آمدید",
+                    "خوش آمدید 👋",
                     color = Color.White,
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold
                 )
 
                 Text(
-                    "چه کاری می‌خواهید انجام دهید؟",
+                    "همه ابزارهای هوشمند شما در یک محیط اختصاصی",
                     color = Color(0xFFD9EEE5),
                     style = MaterialTheme.typography.bodyMedium
                 )
 
-                Spacer(Modifier.height(4.dp))
-
-                Surface(
-                    color = Color.White.copy(alpha = 0.14f),
-                    shape = RoundedCornerShape(50.dp)
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
+                    Surface(
+                        color = Color.White.copy(alpha = 0.14f),
+                        shape = RoundedCornerShape(50.dp)
+                    ) {
+                        Text(
+                            "● محیط خصوصی مالک",
+                            modifier = Modifier.padding(
+                                horizontal = 12.dp,
+                                vertical = 7.dp
+                            ),
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                    }
+
+                    Surface(
+                        color = Color.White.copy(alpha = 0.14f),
+                        shape = RoundedCornerShape(50.dp)
+                    ) {
+                        Text(
+                            "نسخه 1.0",
+                            modifier = Modifier.padding(
+                                horizontal = 12.dp,
+                                vertical = 7.dp
+                            ),
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                    }
+                }
+            }
+        }
+
+        // Main AI action
+
+        DashboardSectionTitle(
+            title = "دستیار هوشمند",
+            subtitle = "شروع کار با هوش مصنوعی"
+        )
+
+        Card(
+            onClick = { onSelect("هوش مصنوعی محلی") },
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(22.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surface
+            )
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(18.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(54.dp)
+                        .clip(RoundedCornerShape(17.dp))
+                        .background(BrandGreen.copy(alpha = 0.14f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("🧠", style = MaterialTheme.typography.headlineMedium)
+                }
+
+                Spacer(Modifier.width(14.dp))
+
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        "●  کنسول اختصاصی مالک",
-                        modifier = Modifier.padding(
-                            horizontal = 12.dp,
-                            vertical = 7.dp
-                        ),
-                        color = Color.White,
+                        "هوش مصنوعی محلی",
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.titleMedium
+                    )
+
+                    Spacer(Modifier.height(4.dp))
+
+                    Text(
+                        "گفت‌وگو با مدل هوش مصنوعی روی دستگاه",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+
+                    Spacer(Modifier.height(7.dp))
+
+                    Text(
+                        "ورود به گفتگو  ←",
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold,
                         style = MaterialTheme.typography.labelMedium
                     )
                 }
             }
         }
 
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text(
-                "ابزارهای هوشمند",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold
-            )
-            Text(
-                "امکانات اختصاصی خود را انتخاب کنید",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.bodySmall
-            )
-        }
+        // Development tools
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            DashboardCard(
-                emoji = "🧠",
-                title = "هوش مصنوعی محلی",
-                description = "گفت‌وگو با مدل آفلاین",
-                modifier = Modifier.weight(1f),
-                onClick = { onSelect("هوش مصنوعی محلی") }
-            )
-            DashboardCard(
-                emoji = "🌐",
-                title = "هوش مصنوعی آنلاین",
-                description = "اتصال به سرویس‌های آنلاین",
-                modifier = Modifier.weight(1f),
-                onClick = { onSelect("هوش مصنوعی آنلاین") }
-            )
-        }
+        DashboardSectionTitle(
+            title = "ساخت و توسعه",
+            subtitle = "ابزارهای برنامه‌نویسی و تولید نرم‌افزار"
+        )
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -507,14 +588,15 @@ fun OwnerDashboard(
             DashboardCard(
                 emoji = "💻",
                 title = "برنامه‌نویسی",
-                description = "ساخت و اصلاح کد",
+                description = "تولید و اصلاح کد",
                 modifier = Modifier.weight(1f),
                 onClick = { onSelect("برنامه‌نویسی و توسعه") }
             )
+
             DashboardCard(
                 emoji = "📱",
                 title = "ساخت اپلیکیشن",
-                description = "ابزارهای توسعه اندروید",
+                description = "توسعه برنامه اندروید",
                 modifier = Modifier.weight(1f),
                 onClick = { onSelect("ساخت اپلیکیشن") }
             )
@@ -531,6 +613,7 @@ fun OwnerDashboard(
                 modifier = Modifier.weight(1f),
                 onClick = { onSelect("ساخت وب‌سایت") }
             )
+
             DashboardCard(
                 emoji = "🛡️",
                 title = "ابزارهای امنیتی",
@@ -540,51 +623,106 @@ fun OwnerDashboard(
             )
         }
 
+        // AI services
+
+        DashboardSectionTitle(
+            title = "مدیریت هوش مصنوعی",
+            subtitle = "مدل‌ها و سرویس‌های هوشمند"
+        )
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             DashboardCard(
+                emoji = "🌐",
+                title = "هوش مصنوعی آنلاین",
+                description = "سرویس‌های آنلاین",
+                modifier = Modifier.weight(1f),
+                onClick = { onSelect("هوش مصنوعی آنلاین") }
+            )
+
+            DashboardCard(
                 emoji = "🗂️",
                 title = "مدیریت مدل",
-                description = "مدل‌ها و فایل‌های هوش مصنوعی",
+                description = "دانلود و مدیریت مدل‌ها",
                 modifier = Modifier.weight(1f),
                 onClick = { onSelect("مدیریت مدل") }
             )
+        }
+
+        // Management
+
+        DashboardSectionTitle(
+            title = "مدیریت برنامه",
+            subtitle = "تنظیمات و حفاظت از اطلاعات"
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
             DashboardCard(
                 emoji = "⚙️",
                 title = "تنظیمات و حافظه",
-                description = "تنظیمات و مدیریت اطلاعات",
+                description = "شخصی‌سازی برنامه",
                 modifier = Modifier.weight(1f),
                 onClick = { onSelect("تنظیمات و حافظه هوشمند") }
             )
+
+            DashboardCard(
+                emoji = "🔐",
+                title = "امنیت مالک",
+                description = "مدیریت دسترسی",
+                modifier = Modifier.weight(1f),
+                onClick = { onSelect("امنیت و مدیریت مالک") }
+            )
         }
 
-        DashboardCard(
-            emoji = "🔐",
-            title = "امنیت و مدیریت مالک",
-            description = "مدیریت دسترسی و امنیت برنامه",
-            modifier = Modifier.fillMaxWidth(),
-            onClick = { onSelect("امنیت و مدیریت مالک") }
-        )
+        // Lock button
 
         OutlinedButton(
             onClick = onLock,
             modifier = Modifier
                 .fillMaxWidth()
-                .height(50.dp),
-            shape = RoundedCornerShape(14.dp)
+                .height(52.dp),
+            shape = RoundedCornerShape(15.dp)
         ) {
-            Text("🔒  قفل برنامه")
+            Text(
+                "🔒  قفل کردن برنامه",
+                fontWeight = FontWeight.SemiBold
+            )
         }
 
         Text(
-            "FARID TECH AI  •  نسخه 1.0",
+            "FARID TECH AI  •  دستیار هوشمند اختصاصی",
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(bottom = 12.dp),
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.labelSmall
+        )
+    }
+}
+
+@Composable
+private fun DashboardSectionTitle(
+    title: String,
+    subtitle: String
+) {
+    Column(
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Text(
+            title,
+            fontWeight = FontWeight.Bold,
+            style = MaterialTheme.typography.titleLarge
+        )
+
+        Text(
+            subtitle,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall
         )
     }
 }
@@ -599,8 +737,8 @@ fun DashboardCard(
 ) {
     Card(
         onClick = onClick,
-        modifier = modifier.heightIn(min = 132.dp),
-        shape = RoundedCornerShape(20.dp),
+        modifier = modifier.heightIn(min = 142.dp),
+        shape = RoundedCornerShape(21.dp),
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surface
         ),
@@ -610,14 +748,24 @@ fun DashboardCard(
     ) {
         Column(
             modifier = Modifier
-                .fillMaxSize()
+                .fillMaxWidth()
                 .padding(15.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+            verticalArrangement = Arrangement.spacedBy(9.dp)
         ) {
-            Text(
-                emoji,
-                style = MaterialTheme.typography.headlineSmall
-            )
+            Box(
+                modifier = Modifier
+                    .size(42.dp)
+                    .clip(RoundedCornerShape(13.dp))
+                    .background(
+                        MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    emoji,
+                    style = MaterialTheme.typography.titleLarge
+                )
+            }
 
             Text(
                 title,
@@ -644,16 +792,13 @@ fun SectionScreen(
             "اتصال به سرویس‌های هوش مصنوعی آنلاین در مرحله توسعه این بخش فعال خواهد شد."
 
         "برنامه‌نویسی و توسعه" ->
-            "ابزارهای برنامه‌نویسی و کمک به توسعه پروژه‌ها در این بخش قرار می‌گیرند."
+            "ابزارهای برنامه‌نویسی، تولید کد، اصلاح خطاها و کمک به توسعه پروژه‌ها در این بخش قرار می‌گیرند."
 
         "ساخت اپلیکیشن" ->
-            "ابزارهای طراحی و توسعه اپلیکیشن اندروید در این بخش قرار خواهند گرفت."
+            "ابزارهای طراحی و توسعه اپلیکیشن اندروید و آماده‌سازی خروجی نصب در این بخش قرار خواهند گرفت."
 
         "ساخت وب‌سایت" ->
             "ابزارهای طراحی، ساخت و مدیریت وب‌سایت در این بخش قرار خواهند گرفت."
-
-        "مدیریت مدل" ->
-            "مدیریت مدل‌های محلی، وضعیت فایل‌ها و دریافت مدل‌ها در این بخش قرار می‌گیرد."
 
         "ابزارهای امنیتی مجاز" ->
             "ابزارهای بررسی امنیت سامانه‌هایی که مجوز بررسی آن‌ها را دارید در این بخش قرار می‌گیرند."
@@ -662,7 +807,7 @@ fun SectionScreen(
             "تنظیمات امنیت و مدیریت دسترسی مالک در این بخش قرار خواهد گرفت."
 
         else ->
-            "تنظیمات برنامه و مدیریت حافظه هوشمند در این بخش قرار خواهند گرفت."
+            "تنظیمات برنامه، شخصی‌سازی و مدیریت حافظه هوشمند در این بخش قرار خواهند گرفت."
     }
 
     Column(
@@ -670,10 +815,22 @@ fun SectionScreen(
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
             .padding(22.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp)
+        verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {
         TextButton(onClick = onBack) {
             Text("← بازگشت به داشبورد")
+        }
+
+        Box(
+            modifier = Modifier
+                .size(58.dp)
+                .clip(RoundedCornerShape(18.dp))
+                .background(
+                    MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            Text("⚙️", style = MaterialTheme.typography.headlineMedium)
         }
 
         Text(
@@ -684,17 +841,28 @@ fun SectionScreen(
 
         Card(
             modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(20.dp),
+            shape = RoundedCornerShape(22.dp),
             colors = CardDefaults.cardColors(
                 containerColor = MaterialTheme.colorScheme.surface
             )
         ) {
-            Text(
-                description,
+            Column(
                 modifier = Modifier.padding(20.dp),
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    "این بخش در حال توسعه است",
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.titleMedium
+                )
+
+                Text(
+                    description,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
     }
 }
