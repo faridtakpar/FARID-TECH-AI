@@ -3,6 +3,7 @@ package com.faridtech.ai
 
 import android.content.Context
 import android.util.AtomicFile
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
@@ -53,6 +54,18 @@ sealed class ProjectFileRestoreResult {
         val reason: String
     ) : ProjectFileRestoreResult()
 }
+
+/**
+ * این استثنا زمانی صادر می‌شود که بررسی Recovery Journal
+ * نتواند تمام عملیات باقی‌مانده را با اطمینان تعیین تکلیف کند.
+ *
+ * در این وضعیت، صفحه پروژه نباید اجازه ادامه عملیات بدهد.
+ */
+class ProjectRecoveryException(
+    val recoveryMessages: List<String>
+) : Exception(
+    recoveryMessages.joinToString("\n")
+)
 
 class ProjectFileChangeManager(context: Context) {
 
@@ -504,6 +517,8 @@ class ProjectFileChangeManager(context: Context) {
                 targetHash = backup.appliedHash,
                 operationType = operationType
             )
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             null
         }
@@ -527,6 +542,8 @@ class ProjectFileChangeManager(context: Context) {
 
             recoveryJournal.remove(operationId)
 
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             false
         }
@@ -552,6 +569,8 @@ class ProjectFileChangeManager(context: Context) {
 
             recoveryJournal.remove(operationId)
 
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             false
         }
@@ -598,6 +617,8 @@ class ProjectFileChangeManager(context: Context) {
 
             true
 
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             false
         }
@@ -654,6 +675,8 @@ class ProjectFileChangeManager(context: Context) {
                     originalSize = originalBytes.size.toLong()
                 )
 
+            } catch (e: CancellationException) {
+                throw e
             } catch (_: Exception) {
                 null
             }
@@ -818,6 +841,8 @@ class ProjectFileChangeManager(context: Context) {
                         backupPath = backup.backupPath
                     )
 
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     ProjectFileChangeResult.Rejected(
                         e.message ?: "خطای نامشخص هنگام اعمال اصلاح."
@@ -1009,6 +1034,8 @@ class ProjectFileChangeManager(context: Context) {
                                 )
                             )
 
+                        } catch (e: CancellationException) {
+                            throw e
                         } catch (_: Exception) {
                             // خرابی یک ورودی نباید کل تاریخچه را متوقف کند.
                         }
@@ -1018,6 +1045,8 @@ class ProjectFileChangeManager(context: Context) {
                         it.createdAt
                     }
 
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (_: Exception) {
                     emptyList()
                 }
@@ -1282,6 +1311,8 @@ class ProjectFileChangeManager(context: Context) {
                         filePath = target.path
                     )
 
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     ProjectFileRestoreResult.Rejected(
                         e.message ?: "خطای نامشخص هنگام بازگردانی نسخه تاریخی."
@@ -1540,6 +1571,8 @@ class ProjectFileChangeManager(context: Context) {
                         filePath = target.path
                     )
 
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     ProjectFileRestoreResult.Rejected(
                         e.message ?: "خطای نامشخص هنگام بازگردانی."
@@ -1550,7 +1583,11 @@ class ProjectFileChangeManager(context: Context) {
 
     // -------------------------------------------------
     // بررسی عملیات باقی‌مانده در Recovery Journal
-    // این متد فایل اصلی را بازنویسی یا ترمیم نمی‌کند.
+    //
+    // اگر حتی یک عملیات حل‌نشده یا نامعتبر باشد،
+    // ProjectRecoveryException صادر می‌شود.
+    //
+    // این متد هیچ فایل اصلی را بازنویسی یا ترمیم نمی‌کند.
     // -------------------------------------------------
 
     suspend fun recoverPendingOperations(
@@ -1561,25 +1598,32 @@ class ProjectFileChangeManager(context: Context) {
             withGlobalLock {
 
                 val messages = mutableListOf<String>()
+                val problems = mutableListOf<String>()
 
                 try {
+
                     if (project == null) {
-                        return@withGlobalLock listOf(
-                            "برای بررسی عملیات بازیابی، پروژه مشخص نشده است."
+                        throw ProjectRecoveryException(
+                            listOf(
+                                "برای بررسی عملیات بازیابی، پروژه مشخص نشده است."
+                            )
                         )
                     }
 
                     val projectRoot = validateProject(project)
-                        ?: return@withGlobalLock listOf(
-                            "مسیر پروژه برای بررسی بازیابی معتبر نیست."
+                        ?: throw ProjectRecoveryException(
+                            listOf(
+                                "مسیر پروژه برای بررسی بازیابی معتبر نیست."
+                            )
                         )
 
                     val canonicalProjectPath =
                         projectRoot.canonicalPath
 
-                    val entries = recoveryJournal.getPendingEntries(
-                        canonicalProjectPath
-                    )
+                    val entries =
+                        recoveryJournal.getPendingEntries(
+                            canonicalProjectPath
+                        )
 
                     if (entries.isEmpty()) {
                         return@withGlobalLock emptyList()
@@ -1588,12 +1632,13 @@ class ProjectFileChangeManager(context: Context) {
                     for (entry in entries) {
 
                         try {
+
                             // بررسی تعلق عملیات به همین پروژه
 
                             if (
                                 entry.projectPath != canonicalProjectPath
                             ) {
-                                messages.add(
+                                problems.add(
                                     "یک عملیات با مسیر پروژه ناسازگار پیدا شد؛ اطلاعات آن حفظ شد."
                                 )
                                 continue
@@ -1601,7 +1646,8 @@ class ProjectFileChangeManager(context: Context) {
 
                             // بررسی مسیر فایل هدف
 
-                            val target = File(entry.filePath).canonicalFile
+                            val target =
+                                File(entry.filePath).canonicalFile
 
                             if (
                                 target.path != entry.filePath ||
@@ -1611,7 +1657,7 @@ class ProjectFileChangeManager(context: Context) {
                                 ) ||
                                 !target.isFile
                             ) {
-                                messages.add(
+                                problems.add(
                                     "مسیر فایل یک عملیات بازیابی معتبر نیست؛ اطلاعات آن حفظ شد."
                                 )
                                 continue
@@ -1625,7 +1671,7 @@ class ProjectFileChangeManager(context: Context) {
                             ).canonicalFile
 
                             if (!backupRoot.isDirectory) {
-                                messages.add(
+                                problems.add(
                                     "پوشه نسخه‌های پشتیبان پیدا نشد؛ اطلاعات عملیات حفظ شد."
                                 )
                                 continue
@@ -1648,7 +1694,7 @@ class ProjectFileChangeManager(context: Context) {
                                 ) ||
                                 backupFile.length() > MAX_FILE_SIZE
                             ) {
-                                messages.add(
+                                problems.add(
                                     "نسخه پشتیبان یک عملیات معتبر نیست؛ اطلاعات آن حفظ شد."
                                 )
                                 continue
@@ -1660,11 +1706,13 @@ class ProjectFileChangeManager(context: Context) {
                                 !isValidHash(entry.beforeHash) ||
                                 !isValidHash(entry.targetHash)
                             ) {
-                                messages.add(
+                                problems.add(
                                     "هش‌های ثبت‌شده در یک عملیات معتبر نیستند؛ اطلاعات آن حفظ شد."
                                 )
                                 continue
                             }
+
+                            // بررسی سلامت نسخه پشتیبان
 
                             val backupBytes =
                                 readLimitedFile(backupFile)
@@ -1673,8 +1721,8 @@ class ProjectFileChangeManager(context: Context) {
                                 backupBytes == null ||
                                 calculateHash(backupBytes) != entry.beforeHash
                             ) {
-                                messages.add(
-                                    "نسخه پشتیبان با هش وضعیت قبلی مطابقت ندارد؛ عملیات برای بررسی دستی حفظ شد."
+                                problems.add(
+                                    "نسخه پشتیبان با هش وضعیت قبلی مطابقت ندارد؛ اطلاعات آن حفظ شد."
                                 )
                                 continue
                             }
@@ -1694,43 +1742,96 @@ class ProjectFileChangeManager(context: Context) {
                                         )
 
                                     if (removed) {
+
                                         messages.add(
-                                            "وضعیت یک عملیات بررسی شد و رکورد بازیابی آن پاک‌سازی شد."
+                                            "وضعیت یک عملیات بررسی و رکورد بازیابی آن پاک‌سازی شد."
                                         )
+
                                     } else {
-                                        messages.add(
+
+                                        problems.add(
                                             "وضعیت فایل مشخص است، اما پاک‌سازی رکورد بازیابی ناموفق بود."
                                         )
                                     }
                                 }
 
                                 is RecoveryCheckResult.Pending -> {
-                                    messages.add(
-                                        "وضعیت یک فایل با نسخه قبل و نسخه پیشنهادی مطابقت ندارد؛ هیچ تغییری در فایل ایجاد نشد و اطلاعات بازیابی حفظ شد."
+
+                                    problems.add(
+                                        "وضعیت یک فایل با نسخه قبل و نسخه پیشنهادی مطابقت ندارد؛ هیچ تغییری در فایل ایجاد نشد."
                                     )
                                 }
 
                                 is RecoveryCheckResult.Invalid -> {
-                                    messages.add(
-                                        "اطلاعات یک عملیات بازیابی معتبر نیست؛ رکورد آن برای بررسی بیشتر حفظ شد."
+
+                                    problems.add(
+                                        "اطلاعات یک عملیات بازیابی معتبر نیست؛ رکورد آن حفظ شد."
                                     )
                                 }
                             }
 
-                        } catch (_: Exception) {
-                            messages.add(
-                                "بررسی یکی از عملیات بازیابی ناموفق بود؛ اطلاعات آن حفظ شد."
+                        } catch (e: CancellationException) {
+
+                            throw e
+
+                        } catch (e: Exception) {
+
+                            problems.add(
+                                "بررسی یکی از عملیات بازیابی ناموفق بود؛ اطلاعات آن حفظ شد: " +
+                                        (e.message ?: "خطای نامشخص")
                             )
                         }
                     }
 
+                    // اگر حتی یک مشکل وجود داشته باشد،
+                    // بازیابی موفق اعلام نمی‌شود.
+
+                    if (problems.isNotEmpty()) {
+
+                        val failureMessages = buildList {
+
+                            add(
+                                "بازیابی پروژه با موفقیت کامل نشد."
+                            )
+
+                            addAll(problems)
+
+                            add(
+                                "هیچ فایل مشکوکی به‌صورت خودکار تغییر نکرده است. " +
+                                        "اطلاعات Journal و نسخه‌های پشتیبان حفظ شده‌اند."
+                            )
+
+                            add(
+                                "تا بررسی مجدد، ادامه عملیات روی این پروژه مجاز نیست."
+                            )
+                        }
+
+                        throw ProjectRecoveryException(
+                            failureMessages
+                        )
+                    }
+
                     messages
 
-                } catch (_: Exception) {
-                    messages.add(
-                        "بررسی Recovery Journal با خطا مواجه شد؛ عملیات حساس باید تا بررسی مجدد متوقف بمانند."
+                } catch (e: CancellationException) {
+
+                    throw e
+
+                } catch (e: ProjectRecoveryException) {
+
+                    throw e
+
+                } catch (e: Exception) {
+
+                    val failureMessages = listOf(
+                        "بررسی Recovery Journal با خطا مواجه شد.",
+                        e.message ?: "خطای نامشخص هنگام بررسی بازیابی.",
+                        "اطلاعات بازیابی حفظ شده‌اند؛ ادامه عملیات پروژه تا بررسی مجدد مجاز نیست."
                     )
-                    messages
+
+                    throw ProjectRecoveryException(
+                        failureMessages
+                    )
                 }
             }
         }
