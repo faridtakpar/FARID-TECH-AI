@@ -15,6 +15,7 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -23,8 +24,14 @@ fun ModelManagementScreen(
     onBack: () -> Unit,
     onExternalPickerStateChanged: (Boolean) -> Unit
 ) {
-    val engine = remember { LocalAIEngine(context) }
-    val downloader = remember { ModelDownloader(context) }
+    val engine = remember {
+        LocalAIEngine(context.applicationContext)
+    }
+
+    val downloader = remember {
+        ModelDownloader(context.applicationContext)
+    }
+
     val scope = rememberCoroutineScope()
 
     var details by remember {
@@ -53,11 +60,40 @@ fun ModelManagementScreen(
 
     fun refreshModel() {
         scope.launch {
-            details = withContext(Dispatchers.IO) {
-                engine.getModelDetails()
-            }
+            try {
+                val currentDetails = engine.getModelDetails()
+                val available = engine.checkModel()
 
-            modelAvailable = engine.checkModel()
+                details = currentDetails
+                modelAvailable = available
+
+            } catch (e: Exception) {
+                details = "خطا در بررسی مدل: ${e.message ?: "نامشخص"}"
+                modelAvailable = false
+            }
+        }
+    }
+
+    fun runOperation(
+        operationStatus: String,
+        operation: suspend () -> String
+    ) {
+        scope.launch {
+            if (busy) return@launch
+
+            busy = true
+            status = operationStatus
+
+            try {
+                status = operation()
+
+            } catch (e: Exception) {
+                status = "خطا: ${e.message ?: "عملیات ناموفق بود"}"
+
+            } finally {
+                busy = false
+                refreshModel()
+            }
         }
     }
 
@@ -65,23 +101,16 @@ fun ModelManagementScreen(
         rememberLauncherForActivityResult(
             contract = ActivityResultContracts.OpenDocument()
         ) { uri ->
+
             onExternalPickerStateChanged(false)
 
             if (uri != null) {
-                scope.launch {
-                    busy = true
-                    status = "در حال واردکردن مدل..."
-
-                    val result = engine.importModelFrom(uri)
-
-                    status = if (result) {
+                runOperation("در حال واردکردن مدل...") {
+                    if (engine.importModelFrom(uri)) {
                         "مدل با موفقیت وارد شد."
                     } else {
                         "واردکردن مدل ناموفق بود."
                     }
-
-                    busy = false
-                    refreshModel()
                 }
             }
         }
@@ -92,23 +121,16 @@ fun ModelManagementScreen(
                 "application/octet-stream"
             )
         ) { uri ->
+
             onExternalPickerStateChanged(false)
 
             if (uri != null) {
-                scope.launch {
-                    busy = true
-                    status = "در حال تهیه نسخه پشتیبان..."
-
-                    val result = engine.exportModelTo(uri)
-
-                    status = if (result) {
+                runOperation("در حال تهیه نسخه پشتیبان...") {
+                    if (engine.exportModelTo(uri)) {
                         "نسخه پشتیبان با موفقیت ذخیره شد."
                     } else {
                         "خروجی‌گرفتن از مدل ناموفق بود."
                     }
-
-                    busy = false
-                    refreshModel()
                 }
             }
         }
@@ -124,7 +146,10 @@ fun ModelManagementScreen(
                     Text("مدیریت مدل هوش مصنوعی")
                 },
                 navigationIcon = {
-                    TextButton(onClick = onBack) {
+                    TextButton(
+                        onClick = onBack,
+                        enabled = !busy
+                    ) {
                         Text("بازگشت")
                     }
                 }
@@ -197,7 +222,9 @@ fun ModelManagementScreen(
                     )
 
                     OutlinedButton(
-                        onClick = { refreshModel() },
+                        onClick = {
+                            refreshModel()
+                        },
                         enabled = !busy,
                         modifier = Modifier.fillMaxWidth()
                     ) {
@@ -224,7 +251,7 @@ fun ModelManagementScreen(
 
                     if (busy && progressText.isNotEmpty()) {
                         LinearProgressIndicator(
-                            progress = { progress },
+                            progress = { progress.coerceIn(0f, 1f) },
                             modifier = Modifier.fillMaxWidth()
                         )
 
@@ -237,6 +264,8 @@ fun ModelManagementScreen(
                     Button(
                         onClick = {
                             scope.launch {
+                                if (busy) return@launch
+
                                 busy = true
                                 progress = 0f
                                 progressText = "شروع دانلود..."
@@ -244,8 +273,8 @@ fun ModelManagementScreen(
 
                                 try {
                                     downloader.download {
-                                            downloaded,
-                                            total ->
+                                        downloaded,
+                                        total ->
 
                                         scope.launch(
                                             Dispatchers.Main.immediate
@@ -268,7 +297,7 @@ fun ModelManagementScreen(
 
                                             progressText =
                                                 String.format(
-                                                    java.util.Locale.US,
+                                                    Locale.US,
                                                     "%.1f از %.1f مگابایت",
                                                     downloadedMb,
                                                     totalMb
@@ -282,10 +311,11 @@ fun ModelManagementScreen(
                                 } catch (e: Exception) {
                                     status =
                                         "خطا: ${e.message ?: "دانلود ناموفق بود"}"
-                                }
 
-                                busy = false
-                                refreshModel()
+                                } finally {
+                                    busy = false
+                                    refreshModel()
+                                }
                             }
                         },
                         enabled = !busy,
@@ -296,14 +326,8 @@ fun ModelManagementScreen(
 
                     OutlinedButton(
                         onClick = {
-                            scope.launch {
-                                busy = true
-                                status = "در حال بارگذاری مدل..."
-
-                                status = engine.loadModel()
-
-                                busy = false
-                                refreshModel()
+                            runOperation("در حال بارگذاری مدل...") {
+                                engine.loadModel()
                             }
                         },
                         enabled = !busy && modelAvailable,
@@ -314,12 +338,9 @@ fun ModelManagementScreen(
 
                     OutlinedButton(
                         onClick = {
-                            scope.launch {
-                                busy = true
+                            runOperation("در حال آزادسازی حافظه...") {
                                 engine.releaseModel()
-                                status = "مدل از حافظه آزاد شد."
-                                busy = false
-                                refreshModel()
+                                "درخواست آزادسازی حافظه انجام شد."
                             }
                         },
                         enabled = !busy,
@@ -344,10 +365,17 @@ fun ModelManagementScreen(
 
                     OutlinedButton(
                         onClick = {
-                            onExternalPickerStateChanged(true)
-                            importLauncher.launch(
-                                arrayOf("*/*")
-                            )
+                            try {
+                                onExternalPickerStateChanged(true)
+
+                                importLauncher.launch(
+                                    arrayOf("*/*")
+                                )
+
+                            } catch (e: Exception) {
+                                onExternalPickerStateChanged(false)
+                                status = "بازکردن انتخاب‌گر فایل ناموفق بود."
+                            }
                         },
                         enabled = !busy,
                         modifier = Modifier.fillMaxWidth()
@@ -357,10 +385,17 @@ fun ModelManagementScreen(
 
                     OutlinedButton(
                         onClick = {
-                            onExternalPickerStateChanged(true)
-                            exportLauncher.launch(
-                                "Qwen2.5-Coder-1.5B-Q4_K_M.gguf"
-                            )
+                            try {
+                                onExternalPickerStateChanged(true)
+
+                                exportLauncher.launch(
+                                    "Qwen2.5-Coder-1.5B-Q4_K_M.gguf"
+                                )
+
+                            } catch (e: Exception) {
+                                onExternalPickerStateChanged(false)
+                                status = "بازکردن محل ذخیره فایل ناموفق بود."
+                            }
                         },
                         enabled = !busy && modelAvailable,
                         modifier = Modifier.fillMaxWidth()
@@ -393,7 +428,9 @@ fun ModelManagementScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     CircularProgressIndicator()
+
                     Spacer(Modifier.width(12.dp))
+
                     Text("لطفاً صبر کنید...")
                 }
             }
