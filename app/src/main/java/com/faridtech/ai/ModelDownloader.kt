@@ -12,8 +12,13 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 internal object ModelStorageCoordinator {
+
     val engineMutex = Mutex()
     val downloadMutex = Mutex()
+
+    // وضعیت مشترک مدل بارگذاری‌شده در موتور Native
+    @Volatile
+    var loadedModelPath: String? = null
 }
 
 class ModelDownloader(context: Context) {
@@ -38,8 +43,10 @@ class ModelDownloader(context: Context) {
         private const val READ_TIMEOUT = 60000
     }
 
+    private val appContext = context.applicationContext
+
     private val modelDirectory = File(
-        context.getExternalFilesDir(null) ?: context.filesDir,
+        appContext.getExternalFilesDir(null) ?: appContext.filesDir,
         "models"
     )
 
@@ -76,6 +83,7 @@ class ModelDownloader(context: Context) {
                 }
 
                 val version = Integer.reverseBytes(input.readInt())
+
                 version in GGUF_VERSION_MIN..GGUF_VERSION_MAX
             }
         } catch (_: Exception) {
@@ -91,7 +99,19 @@ class ModelDownloader(context: Context) {
             hasValidGgufHeader(file)
     }
 
+    /**
+     * فقط در حالی فراخوانی شود که engineMutex در اختیار باشد.
+     */
+    private fun releaseNativeModelLocked() {
+        NativeLlama().nativeRelease()
+        ModelStorageCoordinator.loadedModelPath = null
+    }
+
+    /**
+     * فقط در حالی فراخوانی شود که engineMutex در اختیار باشد.
+     */
     private fun restoreBackupIfNeeded(): Boolean {
+
         if (!backupFile.exists()) {
             return true
         }
@@ -99,6 +119,9 @@ class ModelDownloader(context: Context) {
         if (finalFile.exists()) {
             return false
         }
+
+        // قبل از بازیابی فایل، وضعیت موتور Native پاک می‌شود.
+        releaseNativeModelLocked()
 
         return backupFile.renameTo(finalFile)
     }
@@ -118,11 +141,14 @@ class ModelDownloader(context: Context) {
                 )
             }
 
+            // اگر مدل کامل موجود است، نیازی به دانلود نیست.
             if (isCompleteModel(finalFile)) {
                 return@withLock finalFile
             }
 
+            // بررسی و بازیابی نسخه پشتیبان
             ModelStorageCoordinator.engineMutex.withLock {
+
                 if (!restoreBackupIfNeeded()) {
                     throw IllegalStateException(
                         "نسخه پشتیبان قبلی وجود دارد؛ وضعیت فایل‌ها نیاز به بررسی دارد."
@@ -136,7 +162,9 @@ class ModelDownloader(context: Context) {
                 )
             }
 
+            // بررسی فایل دانلود نیمه‌کاره
             if (partialFile.exists()) {
+
                 if (
                     !hasValidGgufHeader(partialFile) ||
                     partialFile.length() >= EXPECTED_MODEL_SIZE
@@ -155,10 +183,12 @@ class ModelDownloader(context: Context) {
             var connection: HttpURLConnection? = null
 
             try {
+
                 connection = (
                     URL(MODEL_URL).openConnection()
                         as HttpURLConnection
                 ).apply {
+
                     connectTimeout = CONNECT_TIMEOUT
                     readTimeout = READ_TIMEOUT
                     instanceFollowRedirects = true
@@ -200,6 +230,7 @@ class ModelDownloader(context: Context) {
                     if (append) existingSize else 0L
 
                 if (append) {
+
                     val contentRange =
                         connection.getHeaderField("Content-Range")
 
@@ -243,7 +274,9 @@ class ModelDownloader(context: Context) {
                             "محدوده دریافتی سرور با فایل مدل سازگار نیست."
                         )
                     }
+
                 } else {
+
                     val responseSize =
                         connection.contentLengthLong
 
@@ -257,9 +290,13 @@ class ModelDownloader(context: Context) {
                     }
                 }
 
-                onProgress(startSize, EXPECTED_MODEL_SIZE)
+                onProgress(
+                    startSize,
+                    EXPECTED_MODEL_SIZE
+                )
 
                 connection.inputStream.use { input ->
+
                     RandomAccessFile(
                         partialFile,
                         "rw"
@@ -275,6 +312,7 @@ class ModelDownloader(context: Context) {
                         var downloaded = startSize
 
                         while (true) {
+
                             val count = input.read(buffer)
 
                             if (count == -1) {
@@ -322,6 +360,7 @@ class ModelDownloader(context: Context) {
                     )
                 }
 
+                // نصب نهایی فایل با قفل مشترک موتور
                 val installedFile =
                     ModelStorageCoordinator.engineMutex.withLock {
 
@@ -340,12 +379,18 @@ class ModelDownloader(context: Context) {
                         var newFileInstalled = false
 
                         try {
+
+                            // آزادسازی موتور پیش از تغییر فایل مدل
+                            releaseNativeModelLocked()
+
                             if (finalFile.exists()) {
+
                                 if (!finalFile.renameTo(backupFile)) {
                                     throw IllegalStateException(
                                         "نگهداری نسخه قبلی مدل ناموفق بود."
                                     )
                                 }
+
                                 oldFileMoved = true
                             }
 
@@ -376,6 +421,7 @@ class ModelDownloader(context: Context) {
                             finalFile
 
                         } catch (e: Exception) {
+
                             if (
                                 newFileInstalled &&
                                 finalFile.exists()
@@ -390,6 +436,9 @@ class ModelDownloader(context: Context) {
                             ) {
                                 backupFile.renameTo(finalFile)
                             }
+
+                            // موتور آزاد مانده است؛ مسیر مشترک نیز پاک می‌ماند.
+                            ModelStorageCoordinator.loadedModelPath = null
 
                             throw e
                         }
