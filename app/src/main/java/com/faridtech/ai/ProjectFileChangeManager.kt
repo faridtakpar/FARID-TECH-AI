@@ -5,8 +5,8 @@ import android.content.Context
 import android.util.AtomicFile
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -39,7 +39,16 @@ sealed class ProjectFileChangeResult {
         val backupPath: String
     ) : ProjectFileChangeResult()
 
+    data class AppliedWithPendingRecovery(
+        val backupPath: String,
+        val reason: String
+    ) : ProjectFileChangeResult()
+
     data class Rejected(
+        val reason: String
+    ) : ProjectFileChangeResult()
+
+    data class RejectedWithPendingRecovery(
         val reason: String
     ) : ProjectFileChangeResult()
 }
@@ -50,22 +59,23 @@ sealed class ProjectFileRestoreResult {
         val filePath: String
     ) : ProjectFileRestoreResult()
 
+    data class RestoredWithPendingRecovery(
+        val filePath: String,
+        val reason: String
+    ) : ProjectFileRestoreResult()
+
     data class Rejected(
+        val reason: String
+    ) : ProjectFileRestoreResult()
+
+    data class RejectedWithPendingRecovery(
         val reason: String
     ) : ProjectFileRestoreResult()
 }
 
-/**
- * این استثنا زمانی صادر می‌شود که بررسی Recovery Journal
- * نتواند تمام عملیات باقی‌مانده را با اطمینان تعیین تکلیف کند.
- *
- * در این وضعیت، صفحه پروژه نباید اجازه ادامه عملیات بدهد.
- */
 class ProjectRecoveryException(
     val recoveryMessages: List<String>
-) : Exception(
-    recoveryMessages.joinToString("\n")
-)
+) : Exception(recoveryMessages.joinToString("\n"))
 
 class ProjectFileChangeManager(context: Context) {
 
@@ -92,14 +102,9 @@ class ProjectFileChangeManager(context: Context) {
         )
 
         private val BLOCKED_EXTENSIONS = setOf(
-            "keystore",
-            "jks",
-            "pem",
-            "p12",
-            "pfx"
+            "keystore", "jks", "pem", "p12", "pfx"
         )
 
-        // قفل مشترک بین تمام نمونه‌های این کلاس
         private val globalMutex = Mutex()
     }
 
@@ -115,26 +120,22 @@ class ProjectFileChangeManager(context: Context) {
         val appliedHash: String
     )
 
-    // -------------------------------------------------
-    // قفل امن برای عملیات suspend
-    // -------------------------------------------------
+    private enum class RollbackResult {
+        RESTORED_AND_JOURNAL_REMOVED,
+        RESTORED_WITH_PENDING_JOURNAL,
+        FAILED
+    }
 
     private suspend fun <T> withGlobalLock(
         block: suspend () -> T
     ): T {
-
         globalMutex.lock()
-
         return try {
             block()
         } finally {
             globalMutex.unlock()
         }
     }
-
-    // -------------------------------------------------
-    // اعتبارسنجی مسیر پروژه
-    // -------------------------------------------------
 
     private fun validateProject(project: File): File? {
         return try {
@@ -144,27 +145,17 @@ class ProjectFileChangeManager(context: Context) {
             ).canonicalFile
 
             val projectRoot = project.canonicalFile
-
-            val allowedPrefix =
-                projectsRoot.path + File.separator
+            val prefix = projectsRoot.path + File.separator
 
             if (!projectsRoot.isDirectory) return null
             if (!projectRoot.isDirectory) return null
-
-            if (!projectRoot.path.startsWith(allowedPrefix)) {
-                return null
-            }
+            if (!projectRoot.path.startsWith(prefix)) return null
 
             projectRoot
-
         } catch (_: Exception) {
             null
         }
     }
-
-    // -------------------------------------------------
-    // اعتبارسنجی فایل
-    // -------------------------------------------------
 
     private fun validateFile(
         projectRoot: File,
@@ -173,46 +164,25 @@ class ProjectFileChangeManager(context: Context) {
         return try {
             val root = projectRoot.canonicalFile
             val target = file.canonicalFile
+            val prefix = root.path + File.separator
 
-            val rootPrefix =
-                root.path + File.separator
-
-            if (!target.path.startsWith(rootPrefix)) {
-                return null
-            }
-
-            if (!target.isFile || !target.canRead()) {
-                return null
-            }
-
-            if (!target.canWrite()) {
-                return null
-            }
-
-            if (target.length() > MAX_FILE_SIZE) {
-                return null
-            }
+            if (!target.path.startsWith(prefix)) return null
+            if (!target.isFile || !target.canRead()) return null
+            if (!target.canWrite()) return null
+            if (target.length() > MAX_FILE_SIZE) return null
 
             val name = target.name.lowercase()
-
             if (name in BLOCKED_NAMES) return null
 
             val extension = target.extension.lowercase()
-
             if (extension in BLOCKED_EXTENSIONS) return null
-
             if (extension !in ALLOWED_EXTENSIONS) return null
 
             target
-
         } catch (_: Exception) {
             null
         }
     }
-
-    // -------------------------------------------------
-    // اعتبارسنجی مسیر فایل در تاریخچه و بازیابی
-    // -------------------------------------------------
 
     private fun isSafeHistoricalPath(
         projectRoot: File,
@@ -221,29 +191,20 @@ class ProjectFileChangeManager(context: Context) {
         return try {
             val root = projectRoot.canonicalFile
             val target = File(filePath).canonicalFile
+            val prefix = root.path + File.separator
 
-            val rootPrefix =
-                root.path + File.separator
-
-            if (!target.path.startsWith(rootPrefix)) {
-                return false
-            }
+            if (!target.path.startsWith(prefix)) return false
 
             val name = target.name.lowercase()
             val extension = target.extension.lowercase()
 
             name !in BLOCKED_NAMES &&
-                    extension !in BLOCKED_EXTENSIONS &&
-                    extension in ALLOWED_EXTENSIONS
-
+                extension !in BLOCKED_EXTENSIONS &&
+                extension in ALLOWED_EXTENSIONS
         } catch (_: Exception) {
             false
         }
     }
-
-    // -------------------------------------------------
-    // محاسبه هش فایل
-    // -------------------------------------------------
 
     private fun calculateHash(bytes: ByteArray): String {
         val digest = MessageDigest.getInstance("SHA-256")
@@ -258,152 +219,92 @@ class ProjectFileChangeManager(context: Context) {
         return value.matches(Regex("^[a-fA-F0-9]{64}$"))
     }
 
-    // -------------------------------------------------
-    // خواندن کنترل‌شده فایل
-    // -------------------------------------------------
-
     private fun readLimitedFile(file: File): ByteArray? {
         return try {
             if (!file.exists() || !file.isFile || !file.canRead()) {
                 return null
             }
 
-            if (file.length() > MAX_FILE_SIZE) {
-                return null
-            }
+            if (file.length() > MAX_FILE_SIZE) return null
 
-            val atomicFile = AtomicFile(file)
             val output = ByteArrayOutputStream()
             val buffer = ByteArray(8192)
+            var total = 0L
 
-            var totalBytes = 0L
-
-            atomicFile.openRead().use { input ->
-
+            AtomicFile(file).openRead().use { input ->
                 while (true) {
                     val count = input.read(buffer)
+                    if (count == -1) break
 
-                    if (count == -1) {
-                        break
-                    }
-
-                    totalBytes += count
-
-                    if (totalBytes > MAX_FILE_SIZE) {
-                        return null
-                    }
+                    total += count
+                    if (total > MAX_FILE_SIZE) return null
 
                     output.write(buffer, 0, count)
                 }
             }
 
             output.toByteArray()
-
         } catch (_: Exception) {
             null
         }
     }
 
-    // -------------------------------------------------
-    // نوشتن اتمیک فایل
-    // -------------------------------------------------
-
     private fun writeAtomically(
         target: File,
         bytes: ByteArray
     ): Boolean {
-
-        if (bytes.size > MAX_FILE_SIZE) {
-            return false
-        }
+        if (bytes.size > MAX_FILE_SIZE) return false
 
         val atomicFile = AtomicFile(target)
-
         var output: FileOutputStream? = null
 
         return try {
-            val parent = target.parentFile
-                ?: return false
-
-            if (!parent.isDirectory) {
-                return false
-            }
+            val parent = target.parentFile ?: return false
+            if (!parent.isDirectory) return false
 
             val stream = atomicFile.startWrite()
-
             output = stream
 
             stream.write(bytes)
             stream.fd.sync()
-
             atomicFile.finishWrite(stream)
 
             output = null
-
             true
-
         } catch (_: Exception) {
-
-            output?.let { stream ->
+            output?.let {
                 try {
-                    atomicFile.failWrite(stream)
+                    atomicFile.failWrite(it)
                 } catch (_: Exception) {
                 }
             }
-
             false
         }
     }
-
-    // -------------------------------------------------
-    // ذخیره نسخه پشتیبان
-    // -------------------------------------------------
 
     private fun writeBackup(
         backupFile: File,
         originalBytes: ByteArray
     ): Boolean {
-
-        if (originalBytes.size > MAX_FILE_SIZE) {
-            return false
-        }
-
-        return writeAtomically(
-            backupFile,
-            originalBytes
-        )
+        if (originalBytes.size > MAX_FILE_SIZE) return false
+        return writeAtomically(backupFile, originalBytes)
     }
-
-    // -------------------------------------------------
-    // ذخیره Manifest
-    // -------------------------------------------------
 
     private fun writeManifest(
         manifestFile: File,
         json: JSONObject
     ): Boolean {
-
         return try {
             val bytes = json.toString(2)
                 .toByteArray(Charsets.UTF_8)
 
-            if (bytes.size > MAX_MANIFEST_SIZE) {
-                return false
-            }
+            if (bytes.size > MAX_MANIFEST_SIZE) return false
 
-            writeAtomically(
-                manifestFile,
-                bytes
-            )
-
+            writeAtomically(manifestFile, bytes)
         } catch (_: Exception) {
             false
         }
     }
-
-    // -------------------------------------------------
-    // ساخت نسخه پشتیبان از وضعیت فعلی
-    // -------------------------------------------------
 
     private fun createBackupRecord(
         projectRoot: File,
@@ -411,59 +312,44 @@ class ProjectFileChangeManager(context: Context) {
         originalBytes: ByteArray,
         appliedHash: String
     ): CreatedBackup? {
-
         return try {
-            if (originalBytes.size > MAX_FILE_SIZE) {
-                return null
-            }
-
-            if (!isValidHash(appliedHash)) {
-                return null
-            }
+            if (originalBytes.size > MAX_FILE_SIZE) return null
+            if (!isValidHash(appliedHash)) return null
 
             val backupRoot = File(
                 appContext.filesDir,
                 BACKUP_DIRECTORY
             )
 
-            if (
-                !backupRoot.exists() &&
-                !backupRoot.mkdirs()
-            ) {
+            if (!backupRoot.exists() && !backupRoot.mkdirs()) {
                 return null
             }
 
-            val canonicalBackupRoot =
-                backupRoot.canonicalFile
+            val canonicalRoot = backupRoot.canonicalFile
+            if (!canonicalRoot.isDirectory) return null
 
-            if (!canonicalBackupRoot.isDirectory) {
-                return null
-            }
-
-            val backupId = UUID.randomUUID().toString()
+            val id = UUID.randomUUID().toString()
 
             val backupFile = File(
-                canonicalBackupRoot,
-                "$backupId.bak"
+                canonicalRoot,
+                "$id.bak"
             ).canonicalFile
 
             val manifestFile = File(
-                canonicalBackupRoot,
-                "$backupId.json"
+                canonicalRoot,
+                "$id.json"
             ).canonicalFile
 
-            val backupPrefix =
-                canonicalBackupRoot.path + File.separator
+            val prefix = canonicalRoot.path + File.separator
 
             if (
-                !backupFile.path.startsWith(backupPrefix) ||
-                !manifestFile.path.startsWith(backupPrefix)
+                !backupFile.path.startsWith(prefix) ||
+                !manifestFile.path.startsWith(prefix)
             ) {
                 return null
             }
 
-            val originalHash =
-                calculateHash(originalBytes)
+            val originalHash = calculateHash(originalBytes)
 
             if (!writeBackup(backupFile, originalBytes)) {
                 return null
@@ -474,11 +360,8 @@ class ProjectFileChangeManager(context: Context) {
                 put("filePath", target.path)
                 put("originalHash", originalHash)
                 put("appliedHash", appliedHash)
-                put("backupId", backupId)
-                put(
-                    "createdAt",
-                    System.currentTimeMillis()
-                )
+                put("backupId", id)
+                put("createdAt", System.currentTimeMillis())
             }
 
             if (!writeManifest(manifestFile, manifest)) {
@@ -491,15 +374,10 @@ class ProjectFileChangeManager(context: Context) {
                 originalHash = originalHash,
                 appliedHash = appliedHash
             )
-
         } catch (_: Exception) {
             null
         }
     }
-
-    // -------------------------------------------------
-    // ثبت عملیات در Recovery Journal
-    // -------------------------------------------------
 
     private suspend fun beginRecoveryOperation(
         projectRoot: File,
@@ -507,7 +385,6 @@ class ProjectFileChangeManager(context: Context) {
         backup: CreatedBackup,
         operationType: RecoveryOperationType
     ): RecoveryJournalEntry? {
-
         return try {
             recoveryJournal.create(
                 projectPath = projectRoot.canonicalPath,
@@ -524,109 +401,82 @@ class ProjectFileChangeManager(context: Context) {
         }
     }
 
-    // -------------------------------------------------
-    // ثبت پایان موفق عملیات
-    // -------------------------------------------------
-
     private suspend fun finishRecoveryOperation(
         operationId: String
     ): Boolean {
-
         return try {
             val committed =
                 recoveryJournal.markCommitted(operationId)
 
-            if (!committed) {
-                return false
-            }
+            if (!committed) return false
 
             recoveryJournal.remove(operationId)
-
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
             false
         }
     }
-
-    // -------------------------------------------------
-    // پاک‌کردن Journal فقط در صورت تأیید وضعیت اصلی
-    // -------------------------------------------------
 
     private suspend fun removeJournalIfStillOriginal(
         operationId: String,
         target: File,
         beforeHash: String
     ): Boolean {
-
         return try {
-            val currentBytes = readLimitedFile(target)
-                ?: return false
+            val bytes = readLimitedFile(target) ?: return false
 
-            if (calculateHash(currentBytes) != beforeHash) {
+            if (calculateHash(bytes) != beforeHash) {
                 return false
             }
 
             recoveryJournal.remove(operationId)
-
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
             false
         }
     }
-
-    // -------------------------------------------------
-    // تلاش برای بازگرداندن وضعیت قبلی
-    // -------------------------------------------------
 
     private suspend fun rollbackOperation(
         target: File,
         originalBytes: ByteArray,
         beforeHash: String,
         operationId: String?
-    ): Boolean {
-
+    ): RollbackResult {
         return try {
-            val rollbackWritten = writeAtomically(
-                target,
-                originalBytes
-            )
-
-            if (!rollbackWritten) {
-                return false
+            if (!writeAtomically(target, originalBytes)) {
+                return RollbackResult.FAILED
             }
 
-            val rollbackBytes = readLimitedFile(target)
-                ?: return false
+            val rollbackBytes =
+                readLimitedFile(target) ?: return RollbackResult.FAILED
 
-            val rollbackVerified =
-                calculateHash(rollbackBytes) == beforeHash
-
-            if (!rollbackVerified) {
-                return false
+            if (calculateHash(rollbackBytes) != beforeHash) {
+                return RollbackResult.FAILED
             }
 
-            if (operationId != null) {
+            if (operationId == null) {
+                return RollbackResult.RESTORED_AND_JOURNAL_REMOVED
+            }
+
+            if (
                 removeJournalIfStillOriginal(
                     operationId,
                     target,
                     beforeHash
                 )
+            ) {
+                RollbackResult.RESTORED_AND_JOURNAL_REMOVED
+            } else {
+                RollbackResult.RESTORED_WITH_PENDING_JOURNAL
             }
-
-            true
-
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
-            false
+            RollbackResult.FAILED
         }
     }
-
-    // -------------------------------------------------
-    // آماده‌سازی اصلاح فایل
-    // -------------------------------------------------
 
     suspend fun prepareChange(
         project: File,
@@ -634,57 +484,46 @@ class ProjectFileChangeManager(context: Context) {
         proposedContent: String
     ): ProjectFileChangePreview? =
         withContext(Dispatchers.IO) {
-
             try {
-                val projectRoot = validateProject(project)
+                val root = validateProject(project)
                     ?: return@withContext null
 
-                val target = validateFile(
-                    projectRoot,
-                    file
-                ) ?: return@withContext null
+                val target = validateFile(root, file)
+                    ?: return@withContext null
 
                 val proposedBytes =
                     proposedContent.toByteArray(Charsets.UTF_8)
 
-                if (proposedBytes.isEmpty()) {
+                if (
+                    proposedBytes.isEmpty() ||
+                    proposedBytes.size > MAX_FILE_SIZE
+                ) {
                     return@withContext null
                 }
 
-                if (proposedBytes.size > MAX_FILE_SIZE) {
-                    return@withContext null
-                }
+                val originalBytes =
+                    readLimitedFile(target) ?: return@withContext null
 
-                val originalBytes = readLimitedFile(target)
-                    ?: return@withContext null
-
-                val originalContent = String(
-                    originalBytes,
-                    Charsets.UTF_8
-                )
+                val originalContent =
+                    String(originalBytes, Charsets.UTF_8)
 
                 if (originalContent == proposedContent) {
                     return@withContext null
                 }
 
                 ProjectFileChangePreview(
-                    projectPath = projectRoot.path,
+                    projectPath = root.path,
                     filePath = target.path,
                     originalHash = calculateHash(originalBytes),
                     proposedContent = proposedContent,
                     originalSize = originalBytes.size.toLong()
                 )
-
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
                 null
             }
         }
-
-    // -------------------------------------------------
-    // اعمال تغییرات با تأیید مالک و Recovery Journal
-    // -------------------------------------------------
 
     suspend fun applyChange(
         preview: ProjectFileChangePreview,
@@ -700,15 +539,17 @@ class ProjectFileChangeManager(context: Context) {
 
             withGlobalLock {
 
+                var journalEntry: RecoveryJournalEntry? = null
+
                 try {
-                    val projectRoot = validateProject(
+                    val root = validateProject(
                         File(preview.projectPath)
                     ) ?: return@withGlobalLock ProjectFileChangeResult.Rejected(
                         "مسیر پروژه معتبر نیست."
                     )
 
                     val target = validateFile(
-                        projectRoot,
+                        root,
                         File(preview.filePath)
                     ) ?: return@withGlobalLock ProjectFileChangeResult.Rejected(
                         "فایل انتخاب‌شده معتبر یا قابل نوشتن نیست."
@@ -729,13 +570,13 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    val originalBytes = readLimitedFile(target)
-                        ?: return@withGlobalLock ProjectFileChangeResult.Rejected(
-                            "خواندن فایل اصلی ناموفق بود یا اندازه آن بیش از حد مجاز است."
-                        )
+                    val originalBytes =
+                        readLimitedFile(target)
+                            ?: return@withGlobalLock ProjectFileChangeResult.Rejected(
+                                "خواندن فایل اصلی ناموفق بود."
+                            )
 
-                    val originalHash =
-                        calculateHash(originalBytes)
+                    val originalHash = calculateHash(originalBytes)
 
                     if (originalHash != preview.originalHash) {
                         return@withGlobalLock ProjectFileChangeResult.Rejected(
@@ -744,9 +585,7 @@ class ProjectFileChangeManager(context: Context) {
                     }
 
                     val proposedBytes =
-                        preview.proposedContent.toByteArray(
-                            Charsets.UTF_8
-                        )
+                        preview.proposedContent.toByteArray(Charsets.UTF_8)
 
                     if (
                         proposedBytes.isEmpty() ||
@@ -757,85 +596,96 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    val proposedHash =
-                        calculateHash(proposedBytes)
+                    val proposedHash = calculateHash(proposedBytes)
 
                     val backup = createBackupRecord(
-                        projectRoot = projectRoot,
-                        target = target,
-                        originalBytes = originalBytes,
-                        appliedHash = proposedHash
+                        root,
+                        target,
+                        originalBytes,
+                        proposedHash
                     ) ?: return@withGlobalLock ProjectFileChangeResult.Rejected(
-                        "تهیه نسخه پشتیبان و ثبت اطلاعات آن ناموفق بود؛ فایل اصلی تغییر نکرد."
+                        "تهیه نسخه پشتیبان ناموفق بود؛ فایل اصلی تغییر نکرد."
                     )
 
-                    val latestBytes = readLimitedFile(target)
-                        ?: return@withGlobalLock ProjectFileChangeResult.Rejected(
-                            "خواندن مجدد فایل پیش از اصلاح ناموفق بود."
-                        )
+                    val latestBytes =
+                        readLimitedFile(target)
+                            ?: return@withGlobalLock ProjectFileChangeResult.Rejected(
+                                "خواندن مجدد فایل پیش از اصلاح ناموفق بود."
+                            )
 
                     if (calculateHash(latestBytes) != originalHash) {
                         return@withGlobalLock ProjectFileChangeResult.Rejected(
-                            "فایل هنگام آماده‌سازی تغییر کرده است. اصلاح متوقف شد."
+                            "فایل هنگام آماده‌سازی تغییر کرده است."
                         )
                     }
 
-                    val journalEntry = beginRecoveryOperation(
-                        projectRoot = projectRoot,
-                        target = target,
-                        backup = backup,
-                        operationType = RecoveryOperationType.APPLY_CHANGE
+                    journalEntry = beginRecoveryOperation(
+                        root,
+                        target,
+                        backup,
+                        RecoveryOperationType.APPLY_CHANGE
                     ) ?: return@withGlobalLock ProjectFileChangeResult.Rejected(
                         "ثبت عملیات در Recovery Journal ناموفق بود؛ فایل اصلی تغییر نکرد."
                     )
 
-                    val written = writeAtomically(
-                        target,
-                        proposedBytes
-                    )
+                    val entry = journalEntry!!
 
-                    if (!written) {
+                    if (!writeAtomically(target, proposedBytes)) {
                         val removed = removeJournalIfStillOriginal(
-                            journalEntry.id,
+                            entry.id,
                             target,
                             originalHash
                         )
 
-                        return@withGlobalLock ProjectFileChangeResult.Rejected(
-                            if (removed) {
-                                "نوشتن فایل ناموفق بود؛ وضعیت اصلی تأیید شد و نسخه پشتیبان حفظ شده است."
-                            } else {
-                                "نوشتن فایل ناموفق بود یا وضعیت آن قطعی نیست؛ اطلاعات بازیابی حفظ شده است."
-                            }
-                        )
+                        return@withGlobalLock if (removed) {
+                            ProjectFileChangeResult.Rejected(
+                                "نوشتن فایل ناموفق بود؛ وضعیت اصلی تأیید شد."
+                            )
+                        } else {
+                            ProjectFileChangeResult.RejectedWithPendingRecovery(
+                                "نوشتن فایل ناموفق بود یا وضعیت آن قطعی نیست؛ Journal و نسخه پشتیبان حفظ شدند."
+                            )
+                        }
                     }
 
                     val finalBytes = readLimitedFile(target)
-
-                    val verified =
-                        finalBytes != null &&
-                                calculateHash(finalBytes) == proposedHash
+                    val verified = finalBytes != null &&
+                        calculateHash(finalBytes) == proposedHash
 
                     if (!verified) {
-                        val rollbackSucceeded = rollbackOperation(
-                            target = target,
-                            originalBytes = originalBytes,
-                            beforeHash = originalHash,
-                            operationId = journalEntry.id
-                        )
+                        return@withGlobalLock when (
+                            rollbackOperation(
+                                target,
+                                originalBytes,
+                                originalHash,
+                                entry.id
+                            )
+                        ) {
+                            RollbackResult.RESTORED_AND_JOURNAL_REMOVED ->
+                                ProjectFileChangeResult.Rejected(
+                                    "بررسی نهایی ناموفق بود؛ نسخه اصلی بازیابی و تأیید شد."
+                                )
 
-                        return@withGlobalLock ProjectFileChangeResult.Rejected(
-                            if (rollbackSucceeded) {
-                                "بررسی نهایی فایل ناموفق بود؛ نسخه اصلی بازیابی و تأیید شد."
-                            } else {
-                                "بررسی نهایی فایل ناموفق بود و وضعیت بازیابی قطعی نیست؛ اطلاعات Journal و نسخه پشتیبان حفظ شده‌اند."
-                            }
+                            RollbackResult.RESTORED_WITH_PENDING_JOURNAL ->
+                                ProjectFileChangeResult.RejectedWithPendingRecovery(
+                                    "نسخه اصلی بازیابی و تأیید شد، اما پاک‌سازی Journal ناموفق بود."
+                                )
+
+                            RollbackResult.FAILED ->
+                                ProjectFileChangeResult.RejectedWithPendingRecovery(
+                                    "بررسی نهایی و بازگردانی ناموفق بود؛ وضعیت فایل نیازمند بررسی است و اطلاعات بازیابی حفظ شده‌اند."
+                                )
+                        }
+                    }
+
+                    if (!finishRecoveryOperation(entry.id)) {
+                        return@withGlobalLock ProjectFileChangeResult.AppliedWithPendingRecovery(
+                            backupPath = backup.backupPath,
+                            reason = "تغییر فایل با موفقیت اعمال و تأیید شد، اما پاک‌سازی Recovery Journal ناموفق بود. پروژه تا بررسی مجدد قفل می‌ماند."
                         )
                     }
 
-                    // اگر ثبت COMMITTED یا حذف Journal شکست بخورد،
-                    // Journal باقی می‌ماند تا در اجرای بعدی بررسی شود.
-                    finishRecoveryOperation(journalEntry.id)
+                    journalEntry = null
 
                     ProjectFileChangeResult.Applied(
                         backupPath = backup.backupPath
@@ -844,16 +694,18 @@ class ProjectFileChangeManager(context: Context) {
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    ProjectFileChangeResult.Rejected(
-                        e.message ?: "خطای نامشخص هنگام اعمال اصلاح."
-                    )
+                    if (journalEntry != null) {
+                        ProjectFileChangeResult.RejectedWithPendingRecovery(
+                            e.message ?: "عملیات با خطا مواجه شد و رکورد بازیابی حفظ شده است."
+                        )
+                    } else {
+                        ProjectFileChangeResult.Rejected(
+                            e.message ?: "خطای نامشخص هنگام اعمال اصلاح."
+                        )
+                    }
                 }
             }
         }
-
-    // -------------------------------------------------
-    // دریافت تاریخچه نسخه‌های پشتیبان پروژه
-    // -------------------------------------------------
 
     suspend fun getProjectHistory(
         project: File
@@ -861,9 +713,8 @@ class ProjectFileChangeManager(context: Context) {
         withContext(Dispatchers.IO) {
 
             withGlobalLock {
-
                 try {
-                    val projectRoot = validateProject(project)
+                    val root = validateProject(project)
                         ?: return@withGlobalLock emptyList()
 
                     val backupRoot = File(
@@ -875,28 +726,19 @@ class ProjectFileChangeManager(context: Context) {
                         return@withGlobalLock emptyList()
                     }
 
-                    val backupPrefix =
-                        backupRoot.path + File.separator
+                    val prefix = backupRoot.path + File.separator
 
                     val manifests = backupRoot.listFiles()
                         ?.filter {
                             it.isFile &&
-                                    it.extension.equals(
-                                        "json",
-                                        ignoreCase = true
-                                    )
-                        }
-                        ?: return@withGlobalLock emptyList()
+                                it.extension.equals("json", true)
+                        } ?: return@withGlobalLock emptyList()
 
                     val history = mutableListOf<ProjectBackupEntry>()
 
                     for (manifestFile in manifests) {
                         try {
-                            if (
-                                !manifestFile.canonicalPath.startsWith(
-                                    backupPrefix
-                                )
-                            ) {
+                            if (!manifestFile.canonicalPath.startsWith(prefix)) {
                                 continue
                             }
 
@@ -917,16 +759,12 @@ class ProjectFileChangeManager(context: Context) {
                             }
 
                             val manifest = JSONObject(
-                                String(
-                                    manifestBytes,
-                                    Charsets.UTF_8
-                                )
+                                String(manifestBytes, Charsets.UTF_8)
                             )
 
-                            val savedProjectPath =
-                                manifest.optString("projectPath")
-
-                            if (savedProjectPath != projectRoot.path) {
+                            if (
+                                manifest.optString("projectPath") != root.path
+                            ) {
                                 continue
                             }
 
@@ -935,33 +773,22 @@ class ProjectFileChangeManager(context: Context) {
 
                             if (
                                 savedFilePath.isBlank() ||
-                                !isSafeHistoricalPath(
-                                    projectRoot,
-                                    savedFilePath
-                                )
+                                !isSafeHistoricalPath(root, savedFilePath)
                             ) {
                                 continue
                             }
 
-                            val backupId =
-                                manifest.optString("backupId")
-
-                            if (backupId.isBlank()) {
-                                continue
-                            }
+                            val id = manifest.optString("backupId")
 
                             val parsedId = try {
-                                UUID.fromString(backupId)
+                                UUID.fromString(id)
                             } catch (_: Exception) {
                                 continue
                             }
 
-                            if (parsedId.toString() != backupId) {
-                                continue
-                            }
-
                             if (
-                                manifestFile.nameWithoutExtension != backupId
+                                parsedId.toString() != id ||
+                                manifestFile.nameWithoutExtension != id
                             ) {
                                 continue
                             }
@@ -985,65 +812,52 @@ class ProjectFileChangeManager(context: Context) {
 
                             val backupFile = File(
                                 backupRoot,
-                                "$backupId.bak"
+                                "$id.bak"
                             ).canonicalFile
 
-                            val backupPathIsSafe =
-                                backupFile.path.startsWith(backupPrefix)
+                            val safe = backupFile.path.startsWith(prefix)
+                            val exists = safe &&
+                                backupFile.isFile &&
+                                backupFile.canRead()
 
-                            val backupExists =
-                                backupPathIsSafe &&
-                                        backupFile.isFile &&
-                                        backupFile.canRead()
-
-                            val backupSize = if (backupExists) {
+                            val size = if (exists) {
                                 backupFile.length()
                             } else {
                                 0L
                             }
 
-                            var isValid = false
+                            var valid = false
 
-                            if (
-                                backupExists &&
-                                backupSize <= MAX_FILE_SIZE
-                            ) {
-                                val backupBytes =
-                                    readLimitedFile(backupFile)
-
-                                isValid =
-                                    backupBytes != null &&
-                                            calculateHash(backupBytes) ==
-                                            originalHash
+                            if (exists && size <= MAX_FILE_SIZE) {
+                                val bytes = readLimitedFile(backupFile)
+                                valid = bytes != null &&
+                                    calculateHash(bytes) == originalHash
                             }
 
                             history.add(
                                 ProjectBackupEntry(
-                                    backupPath = if (backupPathIsSafe) {
+                                    backupPath = if (safe) {
                                         backupFile.absolutePath
                                     } else {
                                         ""
                                     },
-                                    projectPath = projectRoot.path,
+                                    projectPath = root.path,
                                     filePath = savedFilePath,
                                     originalHash = originalHash,
                                     appliedHash = appliedHash,
                                     createdAt = createdAt,
-                                    backupSize = backupSize,
-                                    isValid = isValid
+                                    backupSize = size,
+                                    isValid = valid
                                 )
                             )
-
                         } catch (e: CancellationException) {
                             throw e
                         } catch (_: Exception) {
-                            // خرابی یک ورودی نباید کل تاریخچه را متوقف کند.
+                            // ورودی خراب از تاریخچه کنار گذاشته می‌شود.
                         }
                     }
 
-                    history.sortedByDescending {
-                        it.createdAt
-                    }
+                    history.sortedByDescending { it.createdAt }
 
                 } catch (e: CancellationException) {
                     throw e
@@ -1052,10 +866,6 @@ class ProjectFileChangeManager(context: Context) {
                 }
             }
         }
-
-    // -------------------------------------------------
-    // بازگردانی نسخه تاریخی با Recovery Journal
-    // -------------------------------------------------
 
     suspend fun restoreHistoricalBackup(
         project: File,
@@ -1073,18 +883,18 @@ class ProjectFileChangeManager(context: Context) {
 
             withGlobalLock {
 
+                var journalEntry: RecoveryJournalEntry? = null
+
                 try {
-                    val projectRoot = validateProject(project)
+                    val root = validateProject(project)
                         ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
                             "مسیر پروژه معتبر نیست."
                         )
 
-                    val target = validateFile(
-                        projectRoot,
-                        file
-                    ) ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
-                        "فایل مقصد معتبر یا قابل نوشتن نیست."
-                    )
+                    val target = validateFile(root, file)
+                        ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
+                            "فایل مقصد معتبر یا قابل نوشتن نیست."
+                        )
 
                     val backupRoot = File(
                         appContext.filesDir,
@@ -1097,20 +907,14 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    val backupPrefix =
-                        backupRoot.path + File.separator
-
-                    val historicalBackup =
-                        File(backupPath).canonicalFile
+                    val prefix = backupRoot.path + File.separator
+                    val historicalBackup = File(backupPath).canonicalFile
 
                     if (
-                        !historicalBackup.path.startsWith(backupPrefix) ||
+                        !historicalBackup.path.startsWith(prefix) ||
                         !historicalBackup.isFile ||
                         !historicalBackup.canRead() ||
-                        !historicalBackup.extension.equals(
-                            "bak",
-                            ignoreCase = true
-                        ) ||
+                        !historicalBackup.extension.equals("bak", true) ||
                         historicalBackup.length() > MAX_FILE_SIZE
                     ) {
                         return@withGlobalLock ProjectFileRestoreResult.Rejected(
@@ -1118,41 +922,40 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    val historicalId =
-                        historicalBackup.nameWithoutExtension
+                    val id = historicalBackup.nameWithoutExtension
 
                     val parsedId = try {
-                        UUID.fromString(historicalId)
+                        UUID.fromString(id)
                     } catch (_: Exception) {
                         return@withGlobalLock ProjectFileRestoreResult.Rejected(
                             "شناسه نسخه تاریخی معتبر نیست."
                         )
                     }
 
-                    if (parsedId.toString() != historicalId) {
+                    if (parsedId.toString() != id) {
                         return@withGlobalLock ProjectFileRestoreResult.Rejected(
                             "شناسه نسخه تاریخی معتبر نیست."
                         )
                     }
 
-                    val historicalManifest = File(
+                    val manifestFile = File(
                         backupRoot,
-                        "$historicalId.json"
+                        "$id.json"
                     ).canonicalFile
 
                     if (
-                        !historicalManifest.path.startsWith(backupPrefix) ||
-                        !historicalManifest.isFile ||
-                        !historicalManifest.canRead() ||
-                        historicalManifest.length() > MAX_MANIFEST_SIZE
+                        !manifestFile.path.startsWith(prefix) ||
+                        !manifestFile.isFile ||
+                        !manifestFile.canRead() ||
+                        manifestFile.length() > MAX_MANIFEST_SIZE
                     ) {
                         return@withGlobalLock ProjectFileRestoreResult.Rejected(
-                            "اطلاعات نسخه تاریخی پیدا نشد یا معتبر نیست."
+                            "اطلاعات نسخه تاریخی معتبر نیست."
                         )
                     }
 
                     val manifestBytes =
-                        AtomicFile(historicalManifest).openRead().use {
+                        AtomicFile(manifestFile).openRead().use {
                             it.readBytes()
                         }
 
@@ -1178,21 +981,18 @@ class ProjectFileChangeManager(context: Context) {
                     val appliedHash =
                         manifest.optString("appliedHash")
 
-                    val savedBackupId =
+                    val savedId =
                         manifest.optString("backupId")
 
                     val createdAt =
                         manifest.optLong("createdAt", 0L)
 
                     if (
-                        savedProjectPath != projectRoot.path ||
+                        savedProjectPath != root.path ||
                         savedFilePath != target.path ||
-                        savedBackupId != historicalId ||
+                        savedId != id ||
                         createdAt <= 0L ||
-                        !isSafeHistoricalPath(
-                            projectRoot,
-                            savedFilePath
-                        ) ||
+                        !isSafeHistoricalPath(root, savedFilePath) ||
                         !isValidHash(originalHash) ||
                         !isValidHash(appliedHash)
                     ) {
@@ -1204,24 +1004,22 @@ class ProjectFileChangeManager(context: Context) {
                     val historicalBytes =
                         readLimitedFile(historicalBackup)
                             ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
-                                "خواندن نسخه تاریخی ناموفق بود یا اندازه آن بیش از حد مجاز است."
+                                "خواندن نسخه تاریخی ناموفق بود."
                             )
 
-                    if (
-                        calculateHash(historicalBytes) != originalHash
-                    ) {
+                    if (calculateHash(historicalBytes) != originalHash) {
                         return@withGlobalLock ProjectFileRestoreResult.Rejected(
                             "نسخه تاریخی آسیب‌دیده یا دستکاری شده است."
                         )
                     }
 
-                    val currentBytes = readLimitedFile(target)
-                        ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
-                            "خواندن فایل فعلی ناموفق بود یا اندازه آن بیش از حد مجاز است."
-                        )
+                    val currentBytes =
+                        readLimitedFile(target)
+                            ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
+                                "خواندن فایل فعلی ناموفق بود."
+                            )
 
-                    val currentHash =
-                        calculateHash(currentBytes)
+                    val currentHash = calculateHash(currentBytes)
 
                     if (currentHash == originalHash) {
                         return@withGlobalLock ProjectFileRestoreResult.Rejected(
@@ -1229,10 +1027,11 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    val latestBytes = readLimitedFile(target)
-                        ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
-                            "خواندن مجدد فایل قبل از بازگردانی ناموفق بود."
-                        )
+                    val latestBytes =
+                        readLimitedFile(target)
+                            ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
+                                "خواندن مجدد فایل ناموفق بود."
+                            )
 
                     if (calculateHash(latestBytes) != currentHash) {
                         return@withGlobalLock ProjectFileRestoreResult.Rejected(
@@ -1240,90 +1039,102 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    val targetHash =
-                        calculateHash(historicalBytes)
+                    val targetHash = calculateHash(historicalBytes)
 
                     val safetyBackup = createBackupRecord(
-                        projectRoot = projectRoot,
-                        target = target,
-                        originalBytes = currentBytes,
-                        appliedHash = targetHash
-                    ) ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
-                        "تهیه پشتیبان از وضعیت فعلی ناموفق بود؛ بازگردانی انجام نشد."
-                    )
-
-                    val journalEntry = beginRecoveryOperation(
-                        projectRoot = projectRoot,
-                        target = target,
-                        backup = safetyBackup,
-                        operationType = RecoveryOperationType.RESTORE_HISTORICAL
-                    ) ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
-                        "ثبت عملیات بازگردانی در Recovery Journal ناموفق بود؛ فایل اصلی تغییر نکرد."
-                    )
-
-                    val restored = writeAtomically(
+                        root,
                         target,
-                        historicalBytes
+                        currentBytes,
+                        targetHash
+                    ) ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
+                        "تهیه پشتیبان از وضعیت فعلی ناموفق بود."
                     )
 
-                    if (!restored) {
+                    journalEntry = beginRecoveryOperation(
+                        root,
+                        target,
+                        safetyBackup,
+                        RecoveryOperationType.RESTORE_HISTORICAL
+                    ) ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
+                        "ثبت عملیات بازگردانی در Journal ناموفق بود؛ فایل تغییر نکرد."
+                    )
+
+                    val entry = journalEntry!!
+
+                    if (!writeAtomically(target, historicalBytes)) {
                         val removed = removeJournalIfStillOriginal(
-                            journalEntry.id,
+                            entry.id,
                             target,
                             currentHash
                         )
 
-                        return@withGlobalLock ProjectFileRestoreResult.Rejected(
-                            if (removed) {
+                        return@withGlobalLock if (removed) {
+                            ProjectFileRestoreResult.Rejected(
                                 "نوشتن نسخه تاریخی ناموفق بود؛ وضعیت قبلی فایل تأیید شد."
-                            } else {
-                                "نوشتن نسخه تاریخی ناموفق بود یا وضعیت فایل قطعی نیست؛ اطلاعات بازیابی حفظ شده است."
-                            }
-                        )
+                            )
+                        } else {
+                            ProjectFileRestoreResult.RejectedWithPendingRecovery(
+                                "نوشتن نسخه تاریخی ناموفق بود یا وضعیت فایل قطعی نیست؛ Journal حفظ شد."
+                            )
+                        }
                     }
 
                     val finalBytes = readLimitedFile(target)
+                    val verified = finalBytes != null &&
+                        calculateHash(finalBytes) == targetHash
 
-                    val restoreVerified =
-                        finalBytes != null &&
-                                calculateHash(finalBytes) == targetHash
+                    if (!verified) {
+                        return@withGlobalLock when (
+                            rollbackOperation(
+                                target,
+                                currentBytes,
+                                currentHash,
+                                entry.id
+                            )
+                        ) {
+                            RollbackResult.RESTORED_AND_JOURNAL_REMOVED ->
+                                ProjectFileRestoreResult.Rejected(
+                                    "بررسی بازگردانی ناموفق بود؛ وضعیت قبلی فایل بازیابی و تأیید شد."
+                                )
 
-                    if (!restoreVerified) {
-                        val rollbackSucceeded = rollbackOperation(
-                            target = target,
-                            originalBytes = currentBytes,
-                            beforeHash = currentHash,
-                            operationId = journalEntry.id
-                        )
+                            RollbackResult.RESTORED_WITH_PENDING_JOURNAL ->
+                                ProjectFileRestoreResult.RejectedWithPendingRecovery(
+                                    "وضعیت قبلی فایل بازیابی شد، اما پاک‌سازی Journal ناموفق بود."
+                                )
 
-                        return@withGlobalLock ProjectFileRestoreResult.Rejected(
-                            if (rollbackSucceeded) {
-                                "بررسی بازگردانی ناموفق بود؛ وضعیت قبلی فایل بازیابی و تأیید شد."
-                            } else {
-                                "بررسی بازگردانی ناموفق بود و وضعیت فایل قطعی نیست؛ Journal و نسخه پشتیبان حفظ شده‌اند."
-                            }
+                            RollbackResult.FAILED ->
+                                ProjectFileRestoreResult.RejectedWithPendingRecovery(
+                                    "بازگردانی و بررسی نهایی ناموفق بود؛ وضعیت فایل نیازمند بررسی است."
+                                )
+                        }
+                    }
+
+                    if (!finishRecoveryOperation(entry.id)) {
+                        return@withGlobalLock ProjectFileRestoreResult.RestoredWithPendingRecovery(
+                            filePath = target.path,
+                            reason = "نسخه تاریخی با موفقیت بازگردانی شد، اما پاک‌سازی Recovery Journal ناموفق بود. پروژه تا بررسی مجدد قفل می‌ماند."
                         )
                     }
 
-                    finishRecoveryOperation(journalEntry.id)
+                    journalEntry = null
 
-                    ProjectFileRestoreResult.Restored(
-                        filePath = target.path
-                    )
+                    ProjectFileRestoreResult.Restored(target.path)
 
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    ProjectFileRestoreResult.Rejected(
-                        e.message ?: "خطای نامشخص هنگام بازگردانی نسخه تاریخی."
-                    )
+                    if (journalEntry != null) {
+                        ProjectFileRestoreResult.RejectedWithPendingRecovery(
+                            e.message ?: "عملیات بازگردانی با خطا مواجه شد و Journal حفظ شده است."
+                        )
+                    } else {
+                        ProjectFileRestoreResult.Rejected(
+                            e.message ?: "خطای نامشخص هنگام بازگردانی نسخه تاریخی."
+                        )
+                    }
                 }
             }
         }
-
-    // -------------------------------------------------
-    // بازگردانی امن نسخه پشتیبان قبلی با Recovery Journal
-    // -------------------------------------------------
 
     suspend fun restoreBackup(
         project: File,
@@ -1341,18 +1152,18 @@ class ProjectFileChangeManager(context: Context) {
 
             withGlobalLock {
 
+                var journalEntry: RecoveryJournalEntry? = null
+
                 try {
-                    val projectRoot = validateProject(project)
+                    val root = validateProject(project)
                         ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
                             "مسیر پروژه معتبر نیست."
                         )
 
-                    val target = validateFile(
-                        projectRoot,
-                        file
-                    ) ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
-                        "فایل مقصد معتبر یا قابل نوشتن نیست."
-                    )
+                    val target = validateFile(root, file)
+                        ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
+                            "فایل مقصد معتبر یا قابل نوشتن نیست."
+                        )
 
                     val backupRoot = File(
                         appContext.filesDir,
@@ -1365,19 +1176,14 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    val backupPrefix =
-                        backupRoot.path + File.separator
-
+                    val prefix = backupRoot.path + File.separator
                     val backupFile = File(backupPath).canonicalFile
 
                     if (
-                        !backupFile.path.startsWith(backupPrefix) ||
+                        !backupFile.path.startsWith(prefix) ||
                         !backupFile.isFile ||
                         !backupFile.canRead() ||
-                        !backupFile.extension.equals(
-                            "bak",
-                            ignoreCase = true
-                        ) ||
+                        !backupFile.extension.equals("bak", true) ||
                         backupFile.length() > MAX_FILE_SIZE
                     ) {
                         return@withGlobalLock ProjectFileRestoreResult.Rejected(
@@ -1385,18 +1191,17 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    val backupId =
-                        backupFile.nameWithoutExtension
+                    val id = backupFile.nameWithoutExtension
 
                     val parsedId = try {
-                        UUID.fromString(backupId)
+                        UUID.fromString(id)
                     } catch (_: Exception) {
                         return@withGlobalLock ProjectFileRestoreResult.Rejected(
                             "شناسه نسخه پشتیبان معتبر نیست."
                         )
                     }
 
-                    if (parsedId.toString() != backupId) {
+                    if (parsedId.toString() != id) {
                         return@withGlobalLock ProjectFileRestoreResult.Rejected(
                             "شناسه نسخه پشتیبان معتبر نیست."
                         )
@@ -1404,11 +1209,11 @@ class ProjectFileChangeManager(context: Context) {
 
                     val manifestFile = File(
                         backupRoot,
-                        "$backupId.json"
+                        "$id.json"
                     ).canonicalFile
 
                     if (
-                        !manifestFile.path.startsWith(backupPrefix) ||
+                        !manifestFile.path.startsWith(prefix) ||
                         !manifestFile.isFile ||
                         !manifestFile.canRead() ||
                         manifestFile.length() > MAX_MANIFEST_SIZE
@@ -1445,32 +1250,29 @@ class ProjectFileChangeManager(context: Context) {
                     val appliedHash =
                         manifest.optString("appliedHash")
 
-                    val savedBackupId =
+                    val savedId =
                         manifest.optString("backupId")
 
                     if (
-                        savedProjectPath != projectRoot.path ||
+                        savedProjectPath != root.path ||
                         savedFilePath != target.path ||
-                        savedBackupId != backupId ||
+                        savedId != id ||
                         !isValidHash(originalHash) ||
                         !isValidHash(appliedHash) ||
-                        !isSafeHistoricalPath(
-                            projectRoot,
-                            savedFilePath
-                        )
+                        !isSafeHistoricalPath(root, savedFilePath)
                     ) {
                         return@withGlobalLock ProjectFileRestoreResult.Rejected(
                             "این نسخه پشتیبان متعلق به این فایل نیست."
                         )
                     }
 
-                    val currentBytes = readLimitedFile(target)
-                        ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
-                            "خواندن فایل فعلی ناموفق بود یا اندازه آن بیش از حد مجاز است."
-                        )
+                    val currentBytes =
+                        readLimitedFile(target)
+                            ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
+                                "خواندن فایل فعلی ناموفق بود."
+                            )
 
-                    val currentHash =
-                        calculateHash(currentBytes)
+                    val currentHash = calculateHash(currentBytes)
 
                     if (currentHash != appliedHash) {
                         return@withGlobalLock ProjectFileRestoreResult.Rejected(
@@ -1478,10 +1280,11 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    val backupBytes = readLimitedFile(backupFile)
-                        ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
-                            "خواندن نسخه پشتیبان ناموفق بود یا اندازه آن بیش از حد مجاز است."
-                        )
+                    val backupBytes =
+                        readLimitedFile(backupFile)
+                            ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
+                                "خواندن نسخه پشتیبان ناموفق بود."
+                            )
 
                     if (calculateHash(backupBytes) != originalHash) {
                         return@withGlobalLock ProjectFileRestoreResult.Rejected(
@@ -1489,10 +1292,11 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    val latestBytes = readLimitedFile(target)
-                        ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
-                            "خواندن مجدد فایل قبل از بازگردانی ناموفق بود."
-                        )
+                    val latestBytes =
+                        readLimitedFile(target)
+                            ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
+                                "خواندن مجدد فایل ناموفق بود."
+                            )
 
                     if (calculateHash(latestBytes) != currentHash) {
                         return@withGlobalLock ProjectFileRestoreResult.Rejected(
@@ -1500,95 +1304,100 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    // از وضعیت فعلی فایل پشتیبان مستقل می‌گیریم.
-                    // این پشتیبان برای Recovery Journal استفاده می‌شود.
-
                     val safetyBackup = createBackupRecord(
-                        projectRoot = projectRoot,
-                        target = target,
-                        originalBytes = currentBytes,
-                        appliedHash = originalHash
-                    ) ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
-                        "تهیه پشتیبان از وضعیت فعلی ناموفق بود؛ بازگردانی انجام نشد."
-                    )
-
-                    val journalEntry = beginRecoveryOperation(
-                        projectRoot = projectRoot,
-                        target = target,
-                        backup = safetyBackup,
-                        operationType = RecoveryOperationType.RESTORE_BACKUP
-                    ) ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
-                        "ثبت عملیات بازگردانی در Recovery Journal ناموفق بود؛ فایل اصلی تغییر نکرد."
-                    )
-
-                    val restored = writeAtomically(
+                        root,
                         target,
-                        backupBytes
+                        currentBytes,
+                        originalHash
+                    ) ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
+                        "تهیه پشتیبان از وضعیت فعلی ناموفق بود."
                     )
 
-                    if (!restored) {
+                    journalEntry = beginRecoveryOperation(
+                        root,
+                        target,
+                        safetyBackup,
+                        RecoveryOperationType.RESTORE_BACKUP
+                    ) ?: return@withGlobalLock ProjectFileRestoreResult.Rejected(
+                        "ثبت عملیات بازگردانی در Journal ناموفق بود؛ فایل تغییر نکرد."
+                    )
+
+                    val entry = journalEntry!!
+
+                    if (!writeAtomically(target, backupBytes)) {
                         val removed = removeJournalIfStillOriginal(
-                            journalEntry.id,
+                            entry.id,
                             target,
                             currentHash
                         )
 
-                        return@withGlobalLock ProjectFileRestoreResult.Rejected(
-                            if (removed) {
+                        return@withGlobalLock if (removed) {
+                            ProjectFileRestoreResult.Rejected(
                                 "بازگردانی ناموفق بود؛ وضعیت قبلی فایل تأیید شد."
-                            } else {
-                                "بازگردانی ناموفق بود یا وضعیت فایل قطعی نیست؛ اطلاعات بازیابی حفظ شده است."
-                            }
-                        )
+                            )
+                        } else {
+                            ProjectFileRestoreResult.RejectedWithPendingRecovery(
+                                "بازگردانی ناموفق بود یا وضعیت فایل قطعی نیست؛ Journal حفظ شد."
+                            )
+                        }
                     }
 
                     val finalBytes = readLimitedFile(target)
+                    val verified = finalBytes != null &&
+                        calculateHash(finalBytes) == originalHash
 
-                    val restoreVerified =
-                        finalBytes != null &&
-                                calculateHash(finalBytes) == originalHash
+                    if (!verified) {
+                        return@withGlobalLock when (
+                            rollbackOperation(
+                                target,
+                                currentBytes,
+                                currentHash,
+                                entry.id
+                            )
+                        ) {
+                            RollbackResult.RESTORED_AND_JOURNAL_REMOVED ->
+                                ProjectFileRestoreResult.Rejected(
+                                    "بررسی بازگردانی ناموفق بود؛ نسخه قبلی بازیابی و تأیید شد."
+                                )
 
-                    if (!restoreVerified) {
-                        val rollbackSucceeded = rollbackOperation(
-                            target = target,
-                            originalBytes = currentBytes,
-                            beforeHash = currentHash,
-                            operationId = journalEntry.id
-                        )
+                            RollbackResult.RESTORED_WITH_PENDING_JOURNAL ->
+                                ProjectFileRestoreResult.RejectedWithPendingRecovery(
+                                    "نسخه قبلی بازیابی شد، اما پاک‌سازی Journal ناموفق بود."
+                                )
 
-                        return@withGlobalLock ProjectFileRestoreResult.Rejected(
-                            if (rollbackSucceeded) {
-                                "بررسی بازگردانی ناموفق بود؛ نسخه قبلی فایل بازیابی و تأیید شد."
-                            } else {
-                                "بررسی بازگردانی ناموفق بود و وضعیت فایل قطعی نیست؛ Journal و نسخه پشتیبان حفظ شده‌اند."
-                            }
+                            RollbackResult.FAILED ->
+                                ProjectFileRestoreResult.RejectedWithPendingRecovery(
+                                    "بررسی بازگردانی ناموفق بود و وضعیت فایل قطعی نیست؛ اطلاعات بازیابی حفظ شده‌اند."
+                                )
+                        }
+                    }
+
+                    if (!finishRecoveryOperation(entry.id)) {
+                        return@withGlobalLock ProjectFileRestoreResult.RestoredWithPendingRecovery(
+                            filePath = target.path,
+                            reason = "فایل با موفقیت بازگردانی شد، اما پاک‌سازی Recovery Journal ناموفق بود. پروژه تا بررسی مجدد قفل می‌ماند."
                         )
                     }
 
-                    finishRecoveryOperation(journalEntry.id)
+                    journalEntry = null
 
-                    ProjectFileRestoreResult.Restored(
-                        filePath = target.path
-                    )
+                    ProjectFileRestoreResult.Restored(target.path)
 
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    ProjectFileRestoreResult.Rejected(
-                        e.message ?: "خطای نامشخص هنگام بازگردانی."
-                    )
+                    if (journalEntry != null) {
+                        ProjectFileRestoreResult.RejectedWithPendingRecovery(
+                            e.message ?: "عملیات بازگردانی با خطا مواجه شد و Journal حفظ شده است."
+                        )
+                    } else {
+                        ProjectFileRestoreResult.Rejected(
+                            e.message ?: "خطای نامشخص هنگام بازگردانی."
+                        )
+                    }
                 }
             }
         }
-
-    // -------------------------------------------------
-    // بررسی عملیات باقی‌مانده در Recovery Journal
-    //
-    // اگر حتی یک عملیات حل‌نشده یا نامعتبر باشد،
-    // ProjectRecoveryException صادر می‌شود.
-    //
-    // این متد هیچ فایل اصلی را بازنویسی یا ترمیم نمی‌کند.
-    // -------------------------------------------------
 
     suspend fun recoverPendingOperations(
         project: File? = null
@@ -1601,7 +1410,6 @@ class ProjectFileChangeManager(context: Context) {
                 val problems = mutableListOf<String>()
 
                 try {
-
                     if (project == null) {
                         throw ProjectRecoveryException(
                             listOf(
@@ -1610,51 +1418,37 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    val projectRoot = validateProject(project)
+                    val root = validateProject(project)
                         ?: throw ProjectRecoveryException(
                             listOf(
                                 "مسیر پروژه برای بررسی بازیابی معتبر نیست."
                             )
                         )
 
-                    val canonicalProjectPath =
-                        projectRoot.canonicalPath
+                    val projectPath = root.canonicalPath
 
                     val entries =
-                        recoveryJournal.getPendingEntries(
-                            canonicalProjectPath
-                        )
+                        recoveryJournal.getPendingEntries(projectPath)
 
                     if (entries.isEmpty()) {
                         return@withGlobalLock emptyList()
                     }
 
                     for (entry in entries) {
-
                         try {
-
-                            // بررسی تعلق عملیات به همین پروژه
-
-                            if (
-                                entry.projectPath != canonicalProjectPath
-                            ) {
+                            if (entry.projectPath != projectPath) {
                                 problems.add(
-                                    "یک عملیات با مسیر پروژه ناسازگار پیدا شد؛ اطلاعات آن حفظ شد."
+                                    "مسیر پروژه یک عملیات بازیابی ناسازگار است؛ اطلاعات آن حفظ شد."
                                 )
                                 continue
                             }
-
-                            // بررسی مسیر فایل هدف
 
                             val target =
                                 File(entry.filePath).canonicalFile
 
                             if (
                                 target.path != entry.filePath ||
-                                !isSafeHistoricalPath(
-                                    projectRoot,
-                                    entry.filePath
-                                ) ||
+                                !isSafeHistoricalPath(root, entry.filePath) ||
                                 !target.isFile
                             ) {
                                 problems.add(
@@ -1662,8 +1456,6 @@ class ProjectFileChangeManager(context: Context) {
                                 )
                                 continue
                             }
-
-                            // بررسی مسیر نسخه پشتیبان
 
                             val backupRoot = File(
                                 appContext.filesDir,
@@ -1677,7 +1469,7 @@ class ProjectFileChangeManager(context: Context) {
                                 continue
                             }
 
-                            val backupPrefix =
+                            val prefix =
                                 backupRoot.path + File.separator
 
                             val backupFile =
@@ -1685,13 +1477,10 @@ class ProjectFileChangeManager(context: Context) {
 
                             if (
                                 backupFile.path != entry.backupPath ||
-                                !backupFile.path.startsWith(backupPrefix) ||
+                                !backupFile.path.startsWith(prefix) ||
                                 !backupFile.isFile ||
                                 !backupFile.canRead() ||
-                                !backupFile.extension.equals(
-                                    "bak",
-                                    ignoreCase = true
-                                ) ||
+                                !backupFile.extension.equals("bak", true) ||
                                 backupFile.length() > MAX_FILE_SIZE
                             ) {
                                 problems.add(
@@ -1699,8 +1488,6 @@ class ProjectFileChangeManager(context: Context) {
                                 )
                                 continue
                             }
-
-                            // بررسی هش‌های ثبت‌شده
 
                             if (
                                 !isValidHash(entry.beforeHash) ||
@@ -1711,8 +1498,6 @@ class ProjectFileChangeManager(context: Context) {
                                 )
                                 continue
                             }
-
-                            // بررسی سلامت نسخه پشتیبان
 
                             val backupBytes =
                                 readLimitedFile(backupFile)
@@ -1727,28 +1512,20 @@ class ProjectFileChangeManager(context: Context) {
                                 continue
                             }
 
-                            // بررسی وضعیت فایل فعلی با Journal
-
-                            val checkResult =
-                                recoveryJournal.inspectOperation(entry)
-
-                            when (checkResult) {
-
+                            when (
+                                val check =
+                                    recoveryJournal.inspectOperation(entry)
+                            ) {
                                 is RecoveryCheckResult.Resolved -> {
-
-                                    val removed =
+                                    if (
                                         recoveryJournal.remove(
-                                            checkResult.operationId
+                                            check.operationId
                                         )
-
-                                    if (removed) {
-
+                                    ) {
                                         messages.add(
                                             "وضعیت یک عملیات بررسی و رکورد بازیابی آن پاک‌سازی شد."
                                         )
-
                                     } else {
-
                                         problems.add(
                                             "وضعیت فایل مشخص است، اما پاک‌سازی رکورد بازیابی ناموفق بود."
                                         )
@@ -1756,81 +1533,54 @@ class ProjectFileChangeManager(context: Context) {
                                 }
 
                                 is RecoveryCheckResult.Pending -> {
-
                                     problems.add(
                                         "وضعیت یک فایل با نسخه قبل و نسخه پیشنهادی مطابقت ندارد؛ هیچ تغییری در فایل ایجاد نشد."
                                     )
                                 }
 
                                 is RecoveryCheckResult.Invalid -> {
-
                                     problems.add(
                                         "اطلاعات یک عملیات بازیابی معتبر نیست؛ رکورد آن حفظ شد."
                                     )
                                 }
                             }
-
                         } catch (e: CancellationException) {
-
                             throw e
-
                         } catch (e: Exception) {
-
                             problems.add(
                                 "بررسی یکی از عملیات بازیابی ناموفق بود؛ اطلاعات آن حفظ شد: " +
-                                        (e.message ?: "خطای نامشخص")
+                                    (e.message ?: "خطای نامشخص")
                             )
                         }
                     }
 
-                    // اگر حتی یک مشکل وجود داشته باشد،
-                    // بازیابی موفق اعلام نمی‌شود.
-
                     if (problems.isNotEmpty()) {
-
-                        val failureMessages = buildList {
-
-                            add(
-                                "بازیابی پروژه با موفقیت کامل نشد."
-                            )
-
-                            addAll(problems)
-
-                            add(
-                                "هیچ فایل مشکوکی به‌صورت خودکار تغییر نکرده است. " +
-                                        "اطلاعات Journal و نسخه‌های پشتیبان حفظ شده‌اند."
-                            )
-
-                            add(
-                                "تا بررسی مجدد، ادامه عملیات روی این پروژه مجاز نیست."
-                            )
-                        }
-
                         throw ProjectRecoveryException(
-                            failureMessages
+                            buildList {
+                                add("بازیابی پروژه با موفقیت کامل نشد.")
+                                addAll(problems)
+                                add(
+                                    "هیچ فایل مشکوکی به‌صورت خودکار تغییر نکرده است. اطلاعات Journal و نسخه‌های پشتیبان حفظ شده‌اند."
+                                )
+                                add(
+                                    "تا بررسی مجدد، ادامه عملیات روی این پروژه مجاز نیست."
+                                )
+                            }
                         )
                     }
 
                     messages
-
                 } catch (e: CancellationException) {
-
                     throw e
-
                 } catch (e: ProjectRecoveryException) {
-
                     throw e
-
                 } catch (e: Exception) {
-
-                    val failureMessages = listOf(
-                        "بررسی Recovery Journal با خطا مواجه شد.",
-                        e.message ?: "خطای نامشخص هنگام بررسی بازیابی.",
-                        "اطلاعات بازیابی حفظ شده‌اند؛ ادامه عملیات پروژه تا بررسی مجدد مجاز نیست."
-                    )
-
                     throw ProjectRecoveryException(
-                        failureMessages
+                        listOf(
+                            "بررسی Recovery Journal با خطا مواجه شد.",
+                            e.message ?: "خطای نامشخص هنگام بررسی بازیابی.",
+                            "اطلاعات بازیابی حفظ شده‌اند؛ ادامه عملیات پروژه تا بررسی مجدد مجاز نیست."
+                        )
                     )
                 }
             }
