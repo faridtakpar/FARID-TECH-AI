@@ -179,10 +179,6 @@ fun ProgrammingScreen(
         ProjectFileChangeManager(context.applicationContext)
     }
 
-    val historyManager = remember(context) {
-        ProjectBackupHistoryManager(context.applicationContext)
-    }
-
     val scope = rememberCoroutineScope()
 
     var selectedLanguage by remember {
@@ -308,7 +304,7 @@ fun ProgrammingScreen(
         restoringBackup ||
         loadingFile
 
-    // بارگذاری تاریخچه نسخه‌های پشتیبان
+    // بارگذاری تاریخچه با مدیر واقعی پشتیبان‌گیری
     fun refreshBackupHistory() {
         val root = projectRoot ?: return
 
@@ -317,7 +313,9 @@ fun ProgrammingScreen(
             backupHistoryError = ""
 
             try {
-                val entries = historyManager.getProjectHistory(root)
+                val entries = withContext(Dispatchers.IO) {
+                    changeManager.getProjectHistory(root)
+                }
 
                 backupHistory.clear()
                 backupHistory.addAll(entries)
@@ -375,9 +373,9 @@ fun ProgrammingScreen(
                     "فایل متنی قابل بررسی در پروژه پیدا نشد."
             }
 
-            val history = historyManager.getProjectHistory(
-                currentProject
-            )
+            val history = withContext(Dispatchers.IO) {
+                changeManager.getProjectHistory(currentProject)
+            }
 
             backupHistory.clear()
             backupHistory.addAll(history)
@@ -922,7 +920,6 @@ fun ProgrammingScreen(
                             )
                         }
 
-                        // بخش تاریخچه نسخه‌های پشتیبان
                         HorizontalDivider()
 
                         Row(
@@ -972,7 +969,6 @@ fun ProgrammingScreen(
                             Text("مشاهده تاریخچه نسخه‌ها")
                         }
 
-                        // دکمه بازگردانی آخرین اصلاح
                         if (lastBackupPath != null) {
                             HorizontalDivider()
 
@@ -1402,142 +1398,14 @@ fun ProgrammingScreen(
 
     // پنجره تاریخچه نسخه‌های پشتیبان
     if (showBackupHistory) {
-        AlertDialog(
-            onDismissRequest = {
+        ProjectBackupHistoryDialog(
+            history = backupHistory,
+            loading = loadingBackupHistory,
+            error = backupHistoryError.ifBlank {
+                null
+            },
+            onDismiss = {
                 showBackupHistory = false
-            },
-            title = {
-                Text("🗂 تاریخچه نسخه‌های پشتیبان")
-            },
-            text = {
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Text(
-                        projectRoot?.name ?: "پروژه",
-                        color = ProgrammingGreen,
-                        fontWeight = FontWeight.SemiBold
-                    )
-
-                    if (loadingBackupHistory) {
-                        LinearProgressIndicator(
-                            modifier = Modifier.fillMaxWidth()
-                        )
-
-                        Text("در حال دریافت تاریخچه...")
-                    } else if (backupHistoryError.isNotBlank()) {
-                        Text(
-                            backupHistoryError,
-                            color = MaterialTheme.colorScheme.error
-                        )
-                    } else if (backupHistory.isEmpty()) {
-                        Text(
-                            "هنوز نسخه پشتیبانی برای این پروژه ثبت نشده است.",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    } else {
-                        LazyColumn(
-                            modifier = Modifier.heightIn(max = 420.dp),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            items(
-                                items = backupHistory,
-                                key = { it.backupId }
-                            ) { entry ->
-
-                                Card(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    shape = RoundedCornerShape(14.dp)
-                                ) {
-                                    Column(
-                                        modifier = Modifier.padding(12.dp),
-                                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                                    ) {
-                                        Text(
-                                            entry.fileName,
-                                            fontWeight = FontWeight.Bold
-                                        )
-
-                                        Text(
-                                            entry.filePath.removePrefix(
-                                                entry.projectPath + File.separator
-                                            ),
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            style = MaterialTheme.typography.labelSmall
-                                        )
-
-                                        Text(
-                                            historyManager.formatBackupDate(
-                                                entry.createdAt
-                                            ),
-                                            style = MaterialTheme.typography.bodySmall
-                                        )
-
-                                        Text(
-                                            "حجم نسخه: ${
-                                                historyManager.formatBackupSize(
-                                                    entry.backupSize
-                                                )
-                                            }",
-                                            style = MaterialTheme.typography.bodySmall
-                                        )
-
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.SpaceBetween
-                                        ) {
-                                            Text(
-                                                if (entry.isHealthy) {
-                                                    "نسخه پشتیبان سالم"
-                                                } else {
-                                                    "نسخه پشتیبان آسیب‌دیده"
-                                                },
-                                                color = if (entry.isHealthy) {
-                                                    ProgrammingGreen
-                                                } else {
-                                                    MaterialTheme.colorScheme.error
-                                                },
-                                                fontWeight = FontWeight.SemiBold,
-                                                style = MaterialTheme.typography.labelMedium
-                                            )
-
-                                            Text(
-                                                if (entry.isHealthy) "✓" else "!",
-                                                color = if (entry.isHealthy) {
-                                                    ProgrammingGreen
-                                                } else {
-                                                    MaterialTheme.colorScheme.error
-                                                },
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showBackupHistory = false
-                    }
-                ) {
-                    Text("بستن")
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = {
-                        refreshBackupHistory()
-                    },
-                    enabled = !loadingBackupHistory
-                ) {
-                    Text("تازه‌سازی")
-                }
             }
         )
     }
