@@ -4,7 +4,6 @@ package com.faridtech.ai
 import android.content.Context
 import android.net.Uri
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -26,7 +25,10 @@ class LocalAIEngine(private val context: Context) {
     }
 
     private val native = NativeLlama()
-    private val engineMutex = Mutex()
+
+    // Shared lock with ModelDownloader.
+    private val engineMutex =
+        ModelStorageCoordinator.engineMutex
 
     @Volatile
     private var loadedModelPath: String? = null
@@ -69,7 +71,6 @@ class LocalAIEngine(private val context: Context) {
                 }
 
                 val version = Integer.reverseBytes(input.readInt())
-
                 version in GGUF_VERSION_MIN..GGUF_VERSION_MAX
             }
         } catch (_: Exception) {
@@ -249,7 +250,10 @@ class LocalAIEngine(private val context: Context) {
                 var newModelInstalled = false
 
                 try {
-                    if (temporaryFile.exists() && !temporaryFile.delete()) {
+                    if (
+                        temporaryFile.exists() &&
+                        !temporaryFile.delete()
+                    ) {
                         return@withLock false
                     }
 
@@ -273,10 +277,7 @@ class LocalAIEngine(private val context: Context) {
                         temporaryFile.length() +
                             if (modelFile.exists()) modelFile.length() else 0L
 
-                    val availableSpace =
-                        parent.usableSpace
-
-                    if (availableSpace < requiredSpace) {
+                    if (parent.usableSpace < requiredSpace) {
                         temporaryFile.delete()
                         return@withLock false
                     }
@@ -306,13 +307,10 @@ class LocalAIEngine(private val context: Context) {
                         return@withLock false
                     }
 
-                    // Keep the backup until the new model is confirmed valid.
-                    if (oldModelMoved) {
-                        if (!backupFile.delete()) {
-                            modelFile.delete()
-                            restorePreviousModel(true)
-                            return@withLock false
-                        }
+                    if (oldModelMoved && !backupFile.delete()) {
+                        modelFile.delete()
+                        restorePreviousModel(true)
+                        return@withLock false
                     }
 
                     loadedModelPath = null
