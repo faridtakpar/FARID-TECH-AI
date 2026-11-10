@@ -46,6 +46,8 @@ class ProjectFileChangeManager(context: Context) {
     companion object {
         private const val MAX_FILE_SIZE = 256 * 1024L
 
+        private const val MAX_MANIFEST_SIZE = 16 * 1024L
+
         private const val PROJECTS_DIRECTORY = "projects"
         private const val BACKUP_DIRECTORY = "project_backups"
 
@@ -77,6 +79,10 @@ class ProjectFileChangeManager(context: Context) {
 
     private val lock = Any()
 
+    // -------------------------------------------------
+    // اعتبارسنجی مسیر پروژه
+    // -------------------------------------------------
+
     private fun validateProject(project: File): File? {
         return try {
             val projectsRoot = File(
@@ -101,6 +107,10 @@ class ProjectFileChangeManager(context: Context) {
             null
         }
     }
+
+    // -------------------------------------------------
+    // اعتبارسنجی فایل
+    // -------------------------------------------------
 
     private fun validateFile(
         projectRoot: File,
@@ -145,6 +155,10 @@ class ProjectFileChangeManager(context: Context) {
         }
     }
 
+    // -------------------------------------------------
+    // محاسبه هش فایل
+    // -------------------------------------------------
+
     private fun calculateHash(bytes: ByteArray): String {
         val digest = MessageDigest.getInstance("SHA-256")
             .digest(bytes)
@@ -154,23 +168,33 @@ class ProjectFileChangeManager(context: Context) {
         }
     }
 
+    // -------------------------------------------------
+    // نوشتن اتمیک فایل
+    // -------------------------------------------------
+
     private fun writeAtomically(
         target: File,
         bytes: ByteArray
     ): Boolean {
+
         var output: FileOutputStream? = null
+
         val atomicFile = AtomicFile(target)
 
         return try {
             output = atomicFile.startWrite()
+
             output.write(bytes)
             output.fd.sync()
 
             atomicFile.finishWrite(output)
+
             output = null
 
             true
+
         } catch (_: Exception) {
+
             if (output != null) {
                 try {
                     atomicFile.failWrite(output)
@@ -182,6 +206,10 @@ class ProjectFileChangeManager(context: Context) {
         }
     }
 
+    // -------------------------------------------------
+    // ذخیره نسخه پشتیبان
+    // -------------------------------------------------
+
     private fun writeBackup(
         backupFile: File,
         originalBytes: ByteArray
@@ -192,15 +220,24 @@ class ProjectFileChangeManager(context: Context) {
         )
     }
 
+    // -------------------------------------------------
+    // ذخیره اطلاعات نسخه پشتیبان
+    // -------------------------------------------------
+
     private fun writeManifest(
         manifestFile: File,
         json: JSONObject
     ): Boolean {
+
         return writeAtomically(
             manifestFile,
             json.toString(2).toByteArray(Charsets.UTF_8)
         )
     }
+
+    // -------------------------------------------------
+    // آماده‌سازی اصلاح فایل
+    // -------------------------------------------------
 
     suspend fun prepareChange(
         project: File,
@@ -210,6 +247,7 @@ class ProjectFileChangeManager(context: Context) {
         withContext(Dispatchers.IO) {
 
             try {
+
                 val projectRoot = validateProject(project)
                     ?: return@withContext null
 
@@ -251,10 +289,15 @@ class ProjectFileChangeManager(context: Context) {
                     proposedContent = proposedContent,
                     originalSize = originalBytes.size.toLong()
                 )
+
             } catch (_: Exception) {
                 null
             }
         }
+
+    // -------------------------------------------------
+    // اعمال تغییرات با تأیید مالک
+    // -------------------------------------------------
 
     suspend fun applyChange(
         preview: ProjectFileChangePreview,
@@ -269,7 +312,9 @@ class ProjectFileChangeManager(context: Context) {
             }
 
             synchronized(lock) {
+
                 try {
+
                     val projectRoot = validateProject(
                         File(preview.projectPath)
                     ) ?: return@synchronized ProjectFileChangeResult.Rejected(
@@ -355,24 +400,32 @@ class ProjectFileChangeManager(context: Context) {
                         "$backupId.json"
                     ).canonicalFile
 
-                    // ابتدا محتوای اصلی ذخیره می‌شود.
+                    // ابتدا نسخه اصلی ذخیره می‌شود.
                     if (!writeBackup(backupFile, originalBytes)) {
                         return@synchronized ProjectFileChangeResult.Rejected(
                             "تهیه نسخه پشتیبان ناموفق بود؛ فایل اصلی تغییر نکرد."
                         )
                     }
 
-                    // اطلاعات اتصال نسخه پشتیبان به فایل اصلی
+                    // ثبت اطلاعات نسخه پشتیبان
                     val manifest = JSONObject().apply {
+
                         put("projectPath", projectRoot.path)
                         put("filePath", target.path)
+
                         put("originalHash", originalHash)
+
                         put(
                             "appliedHash",
                             calculateHash(proposedBytes)
                         )
+
                         put("backupId", backupId)
-                        put("createdAt", System.currentTimeMillis())
+
+                        put(
+                            "createdAt",
+                            System.currentTimeMillis()
+                        )
                     }
 
                     if (!writeManifest(manifestFile, manifest)) {
@@ -381,7 +434,7 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    // بررسی دوباره فایل درست پیش از اعمال
+                    // بررسی دوباره فایل قبل از اعمال
                     val latestBytes = target.readBytes()
 
                     if (
@@ -392,6 +445,7 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
+                    // اعمال محتوای پیشنهادی
                     val written = writeAtomically(
                         target,
                         proposedBytes
@@ -403,7 +457,7 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    // بررسی صحت نسخه نوشته‌شده
+                    // بررسی صحت فایل نوشته‌شده
                     val finalHash = calculateHash(
                         target.readBytes()
                     )
@@ -412,18 +466,29 @@ class ProjectFileChangeManager(context: Context) {
                         calculateHash(proposedBytes)
 
                     if (finalHash != expectedHash) {
-                        // تلاش برای بازگردانی فوری نسخه اصلی
-                        writeAtomically(target, originalBytes)
+
+                        val rollbackSucceeded = writeAtomically(
+                            target,
+                            originalBytes
+                        )
+
+                        if (rollbackSucceeded) {
+                            return@synchronized ProjectFileChangeResult.Rejected(
+                                "بررسی نهایی فایل ناموفق بود. نسخه اصلی بازیابی شد و پشتیبان حفظ شده است."
+                            )
+                        }
 
                         return@synchronized ProjectFileChangeResult.Rejected(
-                            "بررسی نهایی فایل ناموفق بود. نسخه اصلی بازیابی شد و پشتیبان نیز حفظ شده است."
+                            "بررسی نهایی فایل ناموفق بود و بازیابی نسخه اصلی نیز تأیید نشد. نسخه پشتیبان حفظ شده است."
                         )
                     }
 
                     ProjectFileChangeResult.Applied(
                         backupPath = backupFile.absolutePath
                     )
+
                 } catch (e: Exception) {
+
                     ProjectFileChangeResult.Rejected(
                         e.message ?: "خطای نامشخص هنگام اعمال اصلاح."
                     )
@@ -431,15 +496,10 @@ class ProjectFileChangeManager(context: Context) {
             }
         }
 
-    /**
-     * بازگردانی نسخه پشتیبان.
-     *
-     * فقط زمانی اجرا می‌شود که:
-     * 1. مالک تأیید کرده باشد.
-     * 2. نسخه پشتیبان معتبر باشد.
-     * 3. پشتیبان متعلق به همان پروژه و فایل باشد.
-     * 4. فایل فعلی هنوز همان نسخه اصلاح‌شده قبلی باشد.
-     */
+    // -------------------------------------------------
+    // بازگردانی امن نسخه پشتیبان
+    // -------------------------------------------------
+
     suspend fun restoreBackup(
         project: File,
         file: File,
@@ -455,7 +515,9 @@ class ProjectFileChangeManager(context: Context) {
             }
 
             synchronized(lock) {
+
                 try {
+
                     val projectRoot = validateProject(project)
                         ?: return@synchronized ProjectFileRestoreResult.Rejected(
                             "مسیر پروژه معتبر نیست."
@@ -479,9 +541,7 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    val backupFile = File(
-                        backupPath
-                    ).canonicalFile
+                    val backupFile = File(backupPath).canonicalFile
 
                     val backupPrefix =
                         backupRoot.path + File.separator
@@ -489,16 +549,11 @@ class ProjectFileChangeManager(context: Context) {
                     if (
                         !backupFile.path.startsWith(backupPrefix) ||
                         !backupFile.isFile ||
-                        !backupFile.canRead()
+                        !backupFile.canRead() ||
+                        backupFile.length() > MAX_FILE_SIZE
                     ) {
                         return@synchronized ProjectFileRestoreResult.Rejected(
-                            "مسیر نسخه پشتیبان معتبر نیست."
-                        )
-                    }
-
-                    if (backupFile.length() > MAX_FILE_SIZE) {
-                        return@synchronized ProjectFileRestoreResult.Rejected(
-                            "اندازه نسخه پشتیبان بیش از حد مجاز است."
+                            "مسیر یا اندازه نسخه پشتیبان معتبر نیست."
                         )
                     }
 
@@ -510,10 +565,11 @@ class ProjectFileChangeManager(context: Context) {
                     if (
                         !manifestFile.path.startsWith(backupPrefix) ||
                         !manifestFile.isFile ||
-                        !manifestFile.canRead()
+                        !manifestFile.canRead() ||
+                        manifestFile.length() > MAX_MANIFEST_SIZE
                     ) {
                         return@synchronized ProjectFileRestoreResult.Rejected(
-                            "اطلاعات نسخه پشتیبان موجود نیست."
+                            "اطلاعات نسخه پشتیبان معتبر نیست."
                         )
                     }
 
@@ -548,6 +604,7 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
+                    // نگهداری نسخه فعلی برای بازیابی احتمالی
                     val currentBytes = target.readBytes()
 
                     if (currentBytes.size > MAX_FILE_SIZE) {
@@ -559,28 +616,27 @@ class ProjectFileChangeManager(context: Context) {
                     val currentHash =
                         calculateHash(currentBytes)
 
+                    // جلوگیری از حذف تغییرات جدید کاربر
                     if (currentHash != appliedHash) {
                         return@synchronized ProjectFileRestoreResult.Rejected(
                             "فایل پس از اصلاح تغییر کرده است. برای جلوگیری از حذف تغییرات جدید، بازگردانی متوقف شد."
                         )
                     }
 
+                    // بررسی سلامت نسخه پشتیبان
                     val backupBytes = backupFile.readBytes()
 
                     if (
+                        backupBytes.isEmpty() ||
+                        backupBytes.size > MAX_FILE_SIZE ||
                         calculateHash(backupBytes) != originalHash
                     ) {
                         return@synchronized ProjectFileRestoreResult.Rejected(
-                            "نسخه پشتیبان آسیب‌دیده یا دستکاری شده است."
+                            "نسخه پشتیبان خالی، آسیب‌دیده یا دستکاری شده است."
                         )
                     }
 
-                    if (backupBytes.isEmpty()) {
-                        return@synchronized ProjectFileRestoreResult.Rejected(
-                            "نسخه پشتیبان خالی است."
-                        )
-                    }
-
+                    // بازگردانی نسخه اصلی
                     val restored = writeAtomically(
                         target,
                         backupBytes
@@ -592,20 +648,45 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    val restoredHash = calculateHash(
-                        target.readBytes()
-                    )
+                    // بررسی نهایی
+                    val finalBytes = target.readBytes()
 
-                    if (restoredHash != originalHash) {
+                    val restoreVerified =
+                        finalBytes.size <= MAX_FILE_SIZE &&
+                        calculateHash(finalBytes) == originalHash
+
+                    if (!restoreVerified) {
+
+                        // تلاش برای بازیابی نسخه قبل از بازگردانی
+                        val rollbackSucceeded = writeAtomically(
+                            target,
+                            currentBytes
+                        )
+
+                        if (rollbackSucceeded) {
+
+                            val rollbackBytes = target.readBytes()
+
+                            if (
+                                calculateHash(rollbackBytes) == currentHash
+                            ) {
+                                return@synchronized ProjectFileRestoreResult.Rejected(
+                                    "بررسی بازگردانی ناموفق بود؛ نسخه قبلی فایل بازیابی شد."
+                                )
+                            }
+                        }
+
                         return@synchronized ProjectFileRestoreResult.Rejected(
-                            "بررسی نسخه بازگردانی‌شده موفق نبود."
+                            "بررسی بازگردانی ناموفق بود و بازیابی نسخه قبلی نیز تأیید نشد. نسخه پشتیبان اصلی همچنان حفظ شده است."
                         )
                     }
 
                     ProjectFileRestoreResult.Restored(
                         filePath = target.path
                     )
+
                 } catch (e: Exception) {
+
                     ProjectFileRestoreResult.Rejected(
                         e.message ?: "خطای نامشخص هنگام بازگردانی."
                     )
