@@ -1,4 +1,3 @@
-
 package com.faridtech.ai
 
 import android.content.Context
@@ -56,7 +55,8 @@ private data class ProjectLibraryItem(
 fun ProjectLibraryScreen(
     onOpenProject: (File) -> Unit,
     onCreateProject: () -> Unit,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onOpenInAssistant: (File) -> Unit = {}
 ) {
     val context = LocalContext.current
 
@@ -369,7 +369,18 @@ fun ProjectLibraryScreen(
                                 Text("باز کردن پروژه")
                             }
 
-                            Spacer(modifier = Modifier.height(6.dp))
+                            Spacer(modifier = Modifier.height(7.dp))
+
+                            OutlinedButton(
+                                onClick = {
+                                    onOpenInAssistant(project.folder)
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("🤖 تحلیل پروژه با دستیار هوشمند")
+                            }
+
+                            Spacer(modifier = Modifier.height(7.dp))
 
                             OutlinedButton(
                                 onClick = {
