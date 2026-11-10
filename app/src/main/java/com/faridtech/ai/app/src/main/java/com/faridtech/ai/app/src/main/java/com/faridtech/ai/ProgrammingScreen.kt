@@ -1,3 +1,4 @@
+
 package com.faridtech.ai
 
 import android.content.Context
@@ -54,6 +55,9 @@ private val blockedProjectNames = setOf(
     "key.properties"
 )
 
+private const val AI_CODE_START = "<<<FARID_CODE_START>>>"
+private const val AI_CODE_END = "<<<FARID_CODE_END>>>"
+
 private fun isSafeProjectFile(
     projectRoot: File,
     file: File
@@ -61,26 +65,15 @@ private fun isSafeProjectFile(
     return try {
         val root = projectRoot.canonicalFile
         val target = file.canonicalFile
-
         val rootPath = root.path + File.separator
 
-        if (!target.path.startsWith(rootPath)) {
-            return false
-        }
-
-        if (!target.isFile || !target.canRead()) {
-            return false
-        }
-
-        if (target.length() > 256 * 1024) {
-            return false
-        }
+        if (!target.path.startsWith(rootPath)) return false
+        if (!target.isFile || !target.canRead()) return false
+        if (target.length() > 256 * 1024) return false
 
         val name = target.name.lowercase()
 
-        if (name in blockedProjectNames) {
-            return false
-        }
+        if (name in blockedProjectNames) return false
 
         if (
             name.endsWith(".keystore") ||
@@ -88,13 +81,9 @@ private fun isSafeProjectFile(
             name.endsWith(".pem") ||
             name.endsWith(".p12") ||
             name.endsWith(".pfx")
-        ) {
-            return false
-        }
+        ) return false
 
-        val extension = target.extension.lowercase()
-
-        extension in allowedProjectExtensions
+        target.extension.lowercase() in allowedProjectExtensions
     } catch (_: Exception) {
         false
     }
@@ -111,9 +100,7 @@ private suspend fun scanSafeProjectFiles(
     ).canonicalFile
 
     val projectRoot = project.canonicalFile
-
-    val projectsPath =
-        projectsDirectory.path + File.separator
+    val projectsPath = projectsDirectory.path + File.separator
 
     if (
         !projectRoot.isDirectory ||
@@ -126,7 +113,6 @@ private suspend fun scanSafeProjectFiles(
 
     projectRoot.walkTopDown()
         .onEnter { directory ->
-
             if (directory == projectRoot) {
                 true
             } else {
@@ -140,12 +126,7 @@ private suspend fun scanSafeProjectFiles(
             }
         }
         .forEach { file ->
-
-            if (result.size >= 200) {
-                return@forEach
-            }
-
-            if (
+            if (result.size < 200 &&
                 file.isFile &&
                 isSafeProjectFile(projectRoot, file)
             ) {
@@ -158,6 +139,35 @@ private suspend fun scanSafeProjectFiles(
     }
 }
 
+/**
+ * استخراج کد کامل از پاسخ ساختاریافته مدل.
+ * پاسخ بدون نشانگرهای مشخص، اجازه تبدیل به اصلاح فایل را ندارد.
+ */
+private fun extractProposedCode(response: String): String? {
+    val start = response.indexOf(AI_CODE_START)
+    val end = response.indexOf(AI_CODE_END)
+
+    if (start < 0 || end <= start) return null
+
+    var content = response.substring(
+        start + AI_CODE_START.length,
+        end
+    ).trim()
+
+    if (content.startsWith("```")) {
+        val firstNewLine = content.indexOf('\n')
+        if (firstNewLine >= 0) {
+            content = content.substring(firstNewLine + 1)
+        }
+    }
+
+    if (content.endsWith("```")) {
+        content = content.dropLast(3).trimEnd()
+    }
+
+    return content.takeIf { it.isNotBlank() }
+}
+
 @Composable
 fun ProgrammingScreen(
     context: Context,
@@ -166,6 +176,10 @@ fun ProgrammingScreen(
 ) {
     val engine = remember(context) {
         LocalAIEngine(context.applicationContext)
+    }
+
+    val changeManager = remember(context) {
+        ProjectFileChangeManager(context.applicationContext)
     }
 
     val scope = rememberCoroutineScope()
@@ -210,8 +224,6 @@ fun ProgrammingScreen(
         mutableStateOf(false)
     }
 
-    // Project integration
-
     val projectFiles = remember {
         mutableStateListOf<File>()
     }
@@ -236,6 +248,23 @@ fun ProgrammingScreen(
         mutableStateOf("")
     }
 
+    // اطلاعات پیشنهاد اصلاح
+    var pendingChange by remember {
+        mutableStateOf<ProjectFileChangePreview?>(null)
+    }
+
+    var originalPreviewContent by remember {
+        mutableStateOf("")
+    }
+
+    var showChangeReview by remember {
+        mutableStateOf(false)
+    }
+
+    var applyingChange by remember {
+        mutableStateOf(false)
+    }
+
     val projectRoot = remember(project) {
         project?.absoluteFile
     }
@@ -252,12 +281,11 @@ fun ProgrammingScreen(
         checkingModel = false
     }
 
-    // Load safe project file list
-
     LaunchedEffect(projectRoot) {
-
         projectFiles.clear()
         selectedProjectFile = null
+        pendingChange = null
+        showChangeReview = false
         projectError = ""
 
         val currentProject = projectRoot ?: return@LaunchedEffect
@@ -276,7 +304,6 @@ fun ProgrammingScreen(
                 projectError =
                     "فایل متنی قابل بررسی در پروژه پیدا نشد."
             }
-
         } catch (e: Exception) {
             projectError =
                 e.message ?: "خواندن فهرست پروژه ناموفق بود."
@@ -286,20 +313,17 @@ fun ProgrammingScreen(
     }
 
     fun selectProjectFile(file: File) {
-
-        if (loadingFile || generating) return
+        if (loadingFile || generating || applyingChange) return
 
         val root = projectRoot ?: return
 
         scope.launch {
-
             loadingFile = true
             errorMessage = ""
             projectError = ""
 
             try {
                 val content = withContext(Dispatchers.IO) {
-
                     if (!isSafeProjectFile(root, file)) {
                         throw SecurityException(
                             "این فایل اجازه خواندن ندارد."
@@ -312,9 +336,9 @@ fun ProgrammingScreen(
                 code = content
                 selectedProjectFile = file
 
-                val extension = file.extension.lowercase()
-
-                selectedLanguage = when (extension) {
+                selectedLanguage = when (
+                    file.extension.lowercase()
+                ) {
                     "kt" -> "Kotlin"
                     "java" -> "Java"
                     "py" -> "Python"
@@ -323,7 +347,6 @@ fun ProgrammingScreen(
                     "html" -> "HTML"
                     "css" -> "CSS"
                     "js" -> "JavaScript"
-                    "php" -> "PHP"
                     "sql" -> "SQL"
                     "dart" -> "Dart"
                     "swift" -> "Swift"
@@ -334,6 +357,8 @@ fun ProgrammingScreen(
                     "فایل انتخاب‌شده را از نظر ساختار، خطاها و کیفیت کد بررسی کن."
 
                 result = ""
+                pendingChange = null
+                showChangeReview = false
                 showProjectFiles = false
 
             } catch (e: Exception) {
@@ -346,8 +371,7 @@ fun ProgrammingScreen(
     }
 
     fun sendRequest() {
-
-        if (generating) return
+        if (generating || applyingChange) return
 
         if (prompt.isBlank() && code.isBlank()) {
             errorMessage =
@@ -361,9 +385,24 @@ fun ProgrammingScreen(
             return
         }
 
-        val selectedPath = selectedProjectFile?.let { file ->
+        val isFileCorrection =
+            selectedProjectFile != null &&
+                projectRoot != null &&
+                (selectedTask == "اصلاح کد" ||
+                    selectedTask == "رفع خطا")
 
-            val root = projectRoot
+        val submittedCode = code
+        val submittedPrompt = prompt
+        val submittedFile = selectedProjectFile
+        val submittedRoot = projectRoot
+
+        if (isFileCorrection && submittedCode.isBlank()) {
+            errorMessage = "محتوای فایل برای اصلاح خالی است."
+            return
+        }
+
+        val selectedPath = submittedFile?.let { file ->
+            val root = submittedRoot
 
             if (root != null) {
                 try {
@@ -379,24 +418,17 @@ fun ProgrammingScreen(
         }
 
         val formattedPrompt = buildString {
-
             appendLine(
                 "You are a professional programming assistant."
             )
-
             appendLine(
                 "Answer in Persian unless code requires otherwise."
             )
-
             appendLine("Programming language: $selectedLanguage")
             appendLine("Task: $selectedTask")
 
-            if (projectRoot != null) {
-                appendLine()
-                appendLine("Project context:")
-                appendLine(
-                    "The user selected a local project for analysis."
-                )
+            if (submittedRoot != null) {
+                appendLine("The user selected a local project.")
             }
 
             if (selectedPath != null) {
@@ -406,63 +438,192 @@ fun ProgrammingScreen(
             appendLine()
             appendLine("User request:")
             appendLine(
-                prompt.ifBlank {
+                submittedPrompt.ifBlank {
                     "Please analyze the provided code."
                 }
             )
 
-            if (code.isNotBlank()) {
-                appendLine()
-                appendLine("User code:")
-                appendLine("```$selectedLanguage")
-                appendLine(code)
-                appendLine("```")
-            }
-
             appendLine()
-            appendLine(
-                "Analyze carefully and provide technically accurate advice."
-            )
+            appendLine("User code:")
+            appendLine("```$selectedLanguage")
+            appendLine(submittedCode)
+            appendLine("```")
 
-            appendLine(
-                "If code changes are needed, explain exactly which file should change."
-            )
-
-            appendLine(
-                "Do not claim that any local file has been modified."
-            )
-
-            appendLine(
-                "Never request passwords, private keys, or secret credentials."
-            )
-
-            appendLine(
-                "When generating or fixing code, provide complete code where practical."
-            )
+            if (isFileCorrection) {
+                appendLine()
+                appendLine(
+                    "IMPORTANT FILE CORRECTION RULES:"
+                )
+                appendLine(
+                    "Return the COMPLETE corrected file, not a partial snippet."
+                )
+                appendLine(
+                    "Do not omit imports, classes, functions, or unchanged sections."
+                )
+                appendLine(
+                    "Do not add explanations inside the code."
+                )
+                appendLine(
+                    "Do not claim that you modified the local file."
+                )
+                appendLine(
+                    "If you cannot safely produce the complete file, explain the limitation and do not produce a code block."
+                )
+                appendLine()
+                appendLine(
+                    "If you can provide the complete corrected file, format your response exactly like this:"
+                )
+                appendLine(AI_CODE_START)
+                appendLine("COMPLETE FILE CONTENT HERE")
+                appendLine(AI_CODE_END)
+                appendLine(
+                    "Replace the placeholder with the complete source code."
+                )
+            } else {
+                appendLine()
+                appendLine(
+                    "Analyze carefully and provide technically accurate advice."
+                )
+                appendLine(
+                    "If code changes are needed, explain exactly which file should change."
+                )
+                appendLine(
+                    "Do not claim that any local file has been modified."
+                )
+                appendLine(
+                    "Never request passwords, private keys, or secret credentials."
+                )
+                appendLine(
+                    "When generating or fixing code, provide complete code where practical."
+                )
+            }
         }
 
         generating = true
         errorMessage = ""
         result = ""
+        pendingChange = null
+        showChangeReview = false
 
         scope.launch {
+            try {
+                val response = engine.generate(formattedPrompt)
+
+                if (response.isBlank()) {
+                    errorMessage = "مدل پاسخ خالی برگرداند."
+                    return@launch
+                }
+
+                if (!isFileCorrection) {
+                    result = response
+                    return@launch
+                }
+
+                val proposedContent =
+                    extractProposedCode(response)
+
+                if (proposedContent == null) {
+                    result = response
+                    errorMessage =
+                        "مدل کد کامل را در قالب موردنیاز برنگرداند؛ هیچ فایلی تغییر نکرد."
+                    return@launch
+                }
+
+                val root = submittedRoot
+                val file = submittedFile
+
+                if (root == null || file == null) {
+                    errorMessage =
+                        "پروژه یا فایل انتخاب‌شده معتبر نیست."
+                    return@launch
+                }
+
+                // بررسی اینکه نسخه روی دیسک با کد تحلیل‌شده یکسان باشد.
+                val diskContent = withContext(Dispatchers.IO) {
+                    if (!isSafeProjectFile(root, file)) {
+                        throw SecurityException(
+                            "فایل دیگر در مسیر مجاز قرار ندارد."
+                        )
+                    }
+
+                    file.readText(Charsets.UTF_8)
+                }
+
+                if (diskContent != submittedCode) {
+                    errorMessage =
+                        "محتوای فایل از زمان بارگذاری تغییر کرده است. فایل را دوباره انتخاب و تحلیل کن."
+                    return@launch
+                }
+
+                val preview = changeManager.prepareChange(
+                    project = root,
+                    file = file,
+                    proposedContent = proposedContent
+                )
+
+                if (preview == null) {
+                    errorMessage =
+                        "ساخت پیشنهاد اصلاح امن ممکن نشد. فایل اصلی تغییر نکرد."
+                    return@launch
+                }
+
+                originalPreviewContent = submittedCode
+                pendingChange = preview
+                result =
+                    "پیشنهاد اصلاح آماده است. برای بررسی نسخه‌ها، پنجره بازبینی را مشاهده کن."
+                showChangeReview = true
+
+            } catch (e: Exception) {
+                errorMessage =
+                    "خطا در اجرای درخواست: ${
+                        e.message ?: "خطای نامشخص"
+                    }"
+            } finally {
+                generating = false
+            }
+        }
+    }
+
+    fun confirmProjectChange() {
+        val preview = pendingChange ?: return
+
+        if (applyingChange) return
+
+        scope.launch {
+            applyingChange = true
+            errorMessage = ""
 
             try {
-                result = engine.generate(formattedPrompt)
+                val changeResult = changeManager.applyChange(
+                    preview = preview,
+                    ownerConfirmed = true
+                )
 
-                if (result.isBlank()) {
-                    errorMessage = "مدل پاسخ خالی برگرداند."
+                when (changeResult) {
+                    is ProjectFileChangeResult.Applied -> {
+                        code = preview.proposedContent
+                        result =
+                            "اصلاح با موفقیت اعمال شد. نسخه پشتیبان نیز ذخیره شد."
+
+                        selectedProjectFile?.let { file ->
+                            projectError =
+                                "نسخه پشتیبان در حافظه داخلی برنامه ذخیره شد."
+                        }
+
+                        pendingChange = null
+                        showChangeReview = false
+                    }
+
+                    is ProjectFileChangeResult.Rejected -> {
+                        errorMessage = changeResult.reason
+                    }
                 }
 
             } catch (e: Exception) {
-
                 errorMessage =
-                    "خطا در اجرای هوش مصنوعی: ${
-                        e.message ?: "خطای نامشخص"
-                    }"
-
+                    e.message ?: "اعمال اصلاح ناموفق بود."
             } finally {
-                generating = false
+                applyingChange = false
             }
         }
     }
@@ -473,15 +634,12 @@ fun ProgrammingScreen(
             .background(MaterialTheme.colorScheme.background)
     ) {
 
-        // Header
-
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-
             IconButton(onClick = onBack) {
                 Text("←", fontSize = 27.sp)
             }
@@ -530,8 +688,6 @@ fun ProgrammingScreen(
             verticalArrangement = Arrangement.spacedBy(18.dp)
         ) {
 
-            // Welcome
-
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(22.dp),
@@ -560,23 +716,15 @@ fun ProgrammingScreen(
                 }
             }
 
-            // Selected project
-
             if (projectRoot != null) {
-
                 Card(
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(18.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor =
-                            MaterialTheme.colorScheme.surface
-                    )
+                    shape = RoundedCornerShape(18.dp)
                 ) {
                     Column(
                         modifier = Modifier.padding(16.dp),
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-
                         Text(
                             "📁 پروژه متصل",
                             fontWeight = FontWeight.Bold,
@@ -590,34 +738,29 @@ fun ProgrammingScreen(
                         )
 
                         Text(
-                            when {
-                                loadingProjectFiles ->
-                                    "در حال بررسی فایل‌های پروژه..."
-
-                                else ->
-                                    "${projectFiles.size} فایل مجاز برای بررسی پیدا شد."
+                            if (loadingProjectFiles) {
+                                "در حال بررسی فایل‌های پروژه..."
+                            } else {
+                                "${projectFiles.size} فایل مجاز برای بررسی پیدا شد."
                             },
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodySmall
                         )
 
                         OutlinedButton(
-                            onClick = {
-                                showProjectFiles = true
-                            },
+                            onClick = { showProjectFiles = true },
                             enabled = !loadingProjectFiles &&
                                 !loadingFile &&
-                                !generating,
+                                !generating &&
+                                !applyingChange,
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Text("انتخاب فایل از پروژه")
                         }
 
-                        if (selectedProjectFile != null) {
+                        selectedProjectFile?.let { file ->
                             Text(
-                                "فایل انتخاب‌شده: ${
-                                    selectedProjectFile!!.name
-                                }",
+                                "فایل انتخاب‌شده: ${file.name}",
                                 color = ProgrammingGreen,
                                 style = MaterialTheme.typography.bodySmall
                             )
@@ -640,14 +783,9 @@ fun ProgrammingScreen(
                 }
             }
 
-            // Model status
-
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surface
-                )
+                shape = RoundedCornerShape(16.dp)
             ) {
                 Row(
                     modifier = Modifier
@@ -655,7 +793,6 @@ fun ProgrammingScreen(
                         .padding(14.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-
                     Text(
                         when {
                             checkingModel -> "⏳"
@@ -677,10 +814,8 @@ fun ProgrammingScreen(
                             when {
                                 checkingModel ->
                                     "در حال بررسی فایل مدل..."
-
                                 modelAvailable ->
                                     "مدل محلی شناسایی شد"
-
                                 else ->
                                     "مدل نصب نشده است"
                             },
@@ -691,12 +826,9 @@ fun ProgrammingScreen(
                 }
             }
 
-            // Language
-
             Column(
                 verticalArrangement = Arrangement.spacedBy(9.dp)
             ) {
-
                 Text(
                     "زبان برنامه‌نویسی",
                     fontWeight = FontWeight.Bold,
@@ -740,12 +872,9 @@ fun ProgrammingScreen(
                 }
             }
 
-            // Task
-
             Column(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-
                 Text(
                     "نوع درخواست",
                     fontWeight = FontWeight.Bold,
@@ -781,12 +910,9 @@ fun ProgrammingScreen(
                 }
             }
 
-            // Prompt
-
             Column(
                 verticalArrangement = Arrangement.spacedBy(9.dp)
             ) {
-
                 Text(
                     "توضیح درخواست",
                     fontWeight = FontWeight.Bold,
@@ -811,12 +937,9 @@ fun ProgrammingScreen(
                 )
             }
 
-            // Code editor
-
             Column(
                 verticalArrangement = Arrangement.spacedBy(9.dp)
             ) {
-
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -846,7 +969,6 @@ fun ProgrammingScreen(
                         modifier = Modifier.padding(14.dp),
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-
                         Row(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
@@ -873,6 +995,8 @@ fun ProgrammingScreen(
                             onValueChange = {
                                 code = it
                                 errorMessage = ""
+                                pendingChange = null
+                                showChangeReview = false
                             },
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -884,7 +1008,6 @@ fun ProgrammingScreen(
                             ),
                             cursorBrush = SolidColor(ProgrammingGreen),
                             decorationBox = { innerTextField ->
-
                                 Box {
                                     if (code.isEmpty()) {
                                         Text(
@@ -893,7 +1016,6 @@ fun ProgrammingScreen(
                                             fontSize = 13.sp
                                         )
                                     }
-
                                     innerTextField()
                                 }
                             }
@@ -910,13 +1032,12 @@ fun ProgrammingScreen(
                 )
             }
 
-            // Submit
-
             Button(
                 onClick = { sendRequest() },
                 enabled = !generating &&
                     !checkingModel &&
-                    !loadingFile,
+                    !loadingFile &&
+                    !applyingChange,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(56.dp),
@@ -926,9 +1047,7 @@ fun ProgrammingScreen(
                     contentColor = Color(0xFF062A1C)
                 )
             ) {
-
                 if (generating) {
-
                     CircularProgressIndicator(
                         modifier = Modifier.size(22.dp),
                         color = Color(0xFF062A1C),
@@ -936,11 +1055,8 @@ fun ProgrammingScreen(
                     )
 
                     Spacer(Modifier.width(10.dp))
-
                     Text("هوش مصنوعی در حال پردازش...")
-
                 } else {
-
                     Text(
                         "ارسال به هوش مصنوعی  ➜",
                         fontWeight = FontWeight.Bold,
@@ -949,14 +1065,10 @@ fun ProgrammingScreen(
                 }
             }
 
-            // Result
-
             if (result.isNotBlank()) {
-
                 Column(
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-
                     Text(
                         "پاسخ هوش مصنوعی",
                         fontWeight = FontWeight.Bold,
@@ -965,16 +1077,12 @@ fun ProgrammingScreen(
 
                     Card(
                         modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(18.dp),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.surface
-                        )
+                        shape = RoundedCornerShape(18.dp)
                     ) {
                         Column(
                             modifier = Modifier.padding(16.dp),
                             verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
-
                             Text(
                                 result,
                                 color = MaterialTheme.colorScheme.onSurface,
@@ -988,6 +1096,8 @@ fun ProgrammingScreen(
                                     result = ""
                                     errorMessage = ""
                                     selectedProjectFile = null
+                                    pendingChange = null
+                                    showChangeReview = false
                                 },
                                 modifier = Modifier.fillMaxWidth(),
                                 shape = RoundedCornerShape(12.dp)
@@ -1003,10 +1113,7 @@ fun ProgrammingScreen(
         }
     }
 
-    // Project file picker
-
     if (showProjectFiles) {
-
         AlertDialog(
             onDismissRequest = {
                 showProjectFiles = false
@@ -1015,24 +1122,18 @@ fun ProgrammingScreen(
                 Text("انتخاب فایل پروژه")
             },
             text = {
-
                 if (projectFiles.isEmpty()) {
-
                     Text("فایل قابل بررسی وجود ندارد.")
-
                 } else {
-
                     LazyColumn(
                         modifier = Modifier.heightIn(max = 400.dp),
                         verticalArrangement =
                             Arrangement.spacedBy(6.dp)
                     ) {
-
                         items(
                             items = projectFiles,
                             key = { it.absolutePath }
                         ) { file ->
-
                             val relativePath = try {
                                 file.relativeTo(
                                     projectRoot ?: file.parentFile!!
@@ -1073,6 +1174,28 @@ fun ProgrammingScreen(
                     }
                 ) {
                     Text("بستن")
+                }
+            }
+        )
+    }
+
+    // پنجره بازبینی و تأیید مالک
+    val preview = pendingChange
+
+    if (showChangeReview && preview != null) {
+        ProjectChangeReviewDialog(
+            fileName = selectedProjectFile?.name ?: "فایل پروژه",
+            originalContent = originalPreviewContent,
+            proposedContent = preview.proposedContent,
+            applying = applyingChange,
+            onConfirm = {
+                confirmProjectChange()
+            },
+            onCancel = {
+                if (!applyingChange) {
+                    showChangeReview = false
+                    pendingChange = null
+                    result = "پیشنهاد اصلاح رد شد؛ فایل اصلی بدون تغییر باقی ماند."
                 }
             }
         )
