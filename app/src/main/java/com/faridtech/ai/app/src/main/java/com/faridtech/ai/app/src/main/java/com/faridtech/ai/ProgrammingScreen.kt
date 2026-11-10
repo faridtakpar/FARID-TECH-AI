@@ -298,9 +298,7 @@ fun ProgrammingScreen(
         project?.absoluteFile
     }
 
-    // -------------------------------------------------
     // وضعیت ایمنی بازیابی پروژه
-    // -------------------------------------------------
 
     var recoveryInProgress by remember(projectRoot) {
         mutableStateOf(false)
@@ -327,12 +325,11 @@ fun ProgrammingScreen(
         loadingFile ||
         recoveryInProgress
 
-    // -------------------------------------------------
-    // قفل کردن پروژه در صورت باقی ماندن عملیات بازیابی
-    // -------------------------------------------------
+    // قفل کردن پروژه در صورت نیاز به بازیابی مجدد
 
     fun lockProjectForRecovery(reason: String) {
         recoveryReady = false
+
         recoveryError =
             "وضعیت عملیات فایل نیازمند بررسی مجدد است. تا پایان بازیابی، عملیات پروژه غیرفعال خواهد بود."
 
@@ -347,11 +344,14 @@ fun ProgrammingScreen(
         recoveryMessages.add(
             "برای بررسی مجدد وضعیت فایل‌ها، دکمه «تلاش مجدد برای بازیابی» را انتخاب کنید."
         )
+
+        pendingChange = null
+        showChangeReview = false
+        showRestoreConfirmation = false
+        showBackupHistory = false
     }
 
-    // -------------------------------------------------
     // بازیابی و بارگذاری امن پروژه
-    // -------------------------------------------------
 
     suspend fun recoverAndLoadProject(root: File) {
         recoveryInProgress = true
@@ -438,9 +438,7 @@ fun ProgrammingScreen(
         }
     }
 
-    // -------------------------------------------------
     // تازه‌سازی تاریخچه
-    // -------------------------------------------------
 
     fun refreshBackupHistory(force: Boolean = false) {
         if (!projectOperationsAllowed || recoveryInProgress) {
@@ -464,8 +462,11 @@ fun ProgrammingScreen(
                     changeManager.getProjectHistory(root)
                 }
 
-                backupHistory.clear()
-                backupHistory.addAll(entries)
+                // جلوگیری از نمایش تاریخچه در صورت قفل شدن پروژه
+                if (projectOperationsAllowed && !recoveryInProgress) {
+                    backupHistory.clear()
+                    backupHistory.addAll(entries)
+                }
 
             } catch (e: CancellationException) {
                 throw e
@@ -480,9 +481,7 @@ fun ProgrammingScreen(
         }
     }
 
-    // -------------------------------------------------
     // بررسی مدل هوش مصنوعی
-    // -------------------------------------------------
 
     LaunchedEffect(engine) {
         checkingModel = true
@@ -496,9 +495,7 @@ fun ProgrammingScreen(
         checkingModel = false
     }
 
-    // -------------------------------------------------
     // بارگذاری و بازیابی اطلاعات پروژه
-    // -------------------------------------------------
 
     LaunchedEffect(projectRoot) {
         val currentProject = projectRoot
@@ -514,9 +511,7 @@ fun ProgrammingScreen(
         recoverAndLoadProject(currentProject)
     }
 
-    // -------------------------------------------------
     // انتخاب فایل پروژه
-    // -------------------------------------------------
 
     fun selectProjectFile(file: File) {
         if (busy || !projectOperationsAllowed) return
@@ -579,9 +574,7 @@ fun ProgrammingScreen(
         }
     }
 
-    // -------------------------------------------------
     // ارسال درخواست به هوش مصنوعی
-    // -------------------------------------------------
 
     fun sendRequest() {
         if (busy) return
@@ -812,9 +805,7 @@ fun ProgrammingScreen(
         }
     }
 
-    // -------------------------------------------------
     // تأیید و اعمال اصلاح پیشنهادی
-    // -------------------------------------------------
 
     fun confirmProjectChange() {
         if (!projectOperationsAllowed || recoveryInProgress) {
@@ -841,7 +832,6 @@ fun ProgrammingScreen(
 
                     is ProjectFileChangeResult.Applied -> {
                         code = preview.proposedContent
-
                         lastBackupPath = changeResult.backupPath
                         undoTargetFile = File(preview.filePath)
 
@@ -858,14 +848,12 @@ fun ProgrammingScreen(
                     }
 
                     is ProjectFileChangeResult.AppliedWithPendingRecovery -> {
-                        // فایل واقعاً تغییر کرده است.
                         code = preview.proposedContent
-
                         lastBackupPath = changeResult.backupPath
                         undoTargetFile = File(preview.filePath)
 
                         result =
-                            "اصلاح فایل اعمال و تأیید شد؛ اما ثبت نهایی عملیات بازیابی کامل نشده است."
+                            "اصلاح فایل اعمال شده است، اما ثبت نهایی عملیات کامل نشده؛ پروژه تا بازیابی مجدد قفل شد."
 
                         pendingChange = null
                         showChangeReview = false
@@ -898,15 +886,18 @@ fun ProgrammingScreen(
                 errorMessage =
                     e.message ?: "اعمال اصلاح ناموفق بود."
 
+                // وضعیت فایل ممکن است پس از شروع عملیات نامشخص باشد.
+                lockProjectForRecovery(
+                    e.message ?: "خطای غیرمنتظره هنگام اعمال اصلاح فایل."
+                )
+
             } finally {
                 applyingChange = false
             }
         }
     }
 
-    // -------------------------------------------------
     // بازگردانی آخرین اصلاح
-    // -------------------------------------------------
 
     fun restoreLastChange() {
         if (!projectOperationsAllowed || recoveryInProgress) {
@@ -987,7 +978,7 @@ fun ProgrammingScreen(
                         }
 
                         result =
-                            "فایل بازگردانی شد، اما پاک‌سازی Journal کامل نشده است."
+                            "فایل بازگردانی شد، اما Journal هنوز نیازمند بازیابی مجدد است."
 
                         lastBackupPath = null
                         undoTargetFile = null
@@ -1020,15 +1011,17 @@ fun ProgrammingScreen(
                 errorMessage =
                     e.message ?: "بازگردانی نسخه پشتیبان ناموفق بود."
 
+                lockProjectForRecovery(
+                    e.message ?: "خطای غیرمنتظره هنگام بازگردانی نسخه پشتیبان."
+                )
+
             } finally {
                 restoringBackup = false
             }
         }
     }
 
-    // -------------------------------------------------
     // بازگردانی نسخه تاریخی انتخاب‌شده
-    // -------------------------------------------------
 
     fun restoreHistoricalVersion(entry: ProjectBackupEntry) {
 
@@ -1071,10 +1064,8 @@ fun ProgrammingScreen(
                 when (restoreResult) {
 
                     is ProjectFileRestoreResult.Restored -> {
-
                         val restoredContent =
                             withContext(Dispatchers.IO) {
-
                                 if (!isSafeProjectFile(root, target)) {
                                     throw SecurityException(
                                         "فایل بازگردانی‌شده در مسیر مجاز قرار ندارد."
@@ -1110,15 +1101,15 @@ fun ProgrammingScreen(
                                 changeManager.getProjectHistory(root)
                             }
 
-                        backupHistory.clear()
-                        backupHistory.addAll(updatedHistory)
+                        if (projectOperationsAllowed && !recoveryInProgress) {
+                            backupHistory.clear()
+                            backupHistory.addAll(updatedHistory)
+                        }
                     }
 
                     is ProjectFileRestoreResult.RestoredWithPendingRecovery -> {
-
                         val restoredContent =
                             withContext(Dispatchers.IO) {
-
                                 if (!isSafeProjectFile(root, target)) {
                                     throw SecurityException(
                                         "فایل بازگردانی‌شده در مسیر مجاز قرار ندارد."
@@ -1142,9 +1133,10 @@ fun ProgrammingScreen(
                         lastBackupPath = null
                         undoTargetFile = null
                         showRestoreConfirmation = false
+                        showBackupHistory = false
 
                         result =
-                            "نسخه تاریخی بازگردانی شد، اما پاک‌سازی Journal کامل نشده است."
+                            "نسخه تاریخی بازگردانی شد، اما Journal هنوز نیازمند بازیابی مجدد است."
 
                         lockProjectForRecovery(
                             restoreResult.reason
@@ -1157,6 +1149,7 @@ fun ProgrammingScreen(
 
                     is ProjectFileRestoreResult.RejectedWithPendingRecovery -> {
                         errorMessage = restoreResult.reason
+                        showBackupHistory = false
 
                         lockProjectForRecovery(
                             restoreResult.reason
@@ -1171,15 +1164,17 @@ fun ProgrammingScreen(
                 errorMessage =
                     e.message ?: "بازگردانی نسخه تاریخی ناموفق بود."
 
+                lockProjectForRecovery(
+                    e.message ?: "خطای غیرمنتظره هنگام بازگردانی نسخه تاریخی."
+                )
+
             } finally {
                 restoringBackup = false
             }
         }
     }
 
-    // -------------------------------------------------
     // رابط کاربری
-    // -------------------------------------------------
 
     Column(
         modifier = Modifier
@@ -1832,9 +1827,7 @@ fun ProgrammingScreen(
         }
     }
 
-    // -------------------------------------------------
     // پنجره انتخاب فایل پروژه
-    // -------------------------------------------------
 
     if (showProjectFiles) {
         AlertDialog(
@@ -1902,9 +1895,7 @@ fun ProgrammingScreen(
         )
     }
 
-    // -------------------------------------------------
     // پنجره تاریخچه و بازگردانی نسخه‌های قدیمی
-    // -------------------------------------------------
 
     if (showBackupHistory) {
         ProjectBackupHistoryDialog(
@@ -1925,9 +1916,7 @@ fun ProgrammingScreen(
         )
     }
 
-    // -------------------------------------------------
     // پنجره بازبینی و تأیید اصلاح
-    // -------------------------------------------------
 
     val preview = pendingChange
 
@@ -1951,9 +1940,7 @@ fun ProgrammingScreen(
         )
     }
 
-    // -------------------------------------------------
     // تأیید جداگانه برای بازگردانی آخرین نسخه
-    // -------------------------------------------------
 
     if (showRestoreConfirmation) {
         AlertDialog(
