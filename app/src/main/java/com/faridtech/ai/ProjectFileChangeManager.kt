@@ -19,6 +19,17 @@ data class ProjectFileChangePreview(
     val originalSize: Long
 )
 
+data class ProjectBackupEntry(
+    val backupPath: String,
+    val projectPath: String,
+    val filePath: String,
+    val originalHash: String,
+    val appliedHash: String,
+    val createdAt: Long,
+    val backupSize: Long,
+    val isValid: Boolean
+)
+
 sealed class ProjectFileChangeResult {
 
     data class Applied(
@@ -45,7 +56,6 @@ class ProjectFileChangeManager(context: Context) {
 
     companion object {
         private const val MAX_FILE_SIZE = 256 * 1024L
-
         private const val MAX_MANIFEST_SIZE = 16 * 1024L
 
         private const val PROJECTS_DIRECTORY = "projects"
@@ -76,7 +86,6 @@ class ProjectFileChangeManager(context: Context) {
     }
 
     private val appContext = context.applicationContext
-
     private val lock = Any()
 
     // -------------------------------------------------
@@ -103,6 +112,7 @@ class ProjectFileChangeManager(context: Context) {
             }
 
             projectRoot
+
         } catch (_: Exception) {
             null
         }
@@ -150,8 +160,39 @@ class ProjectFileChangeManager(context: Context) {
             if (extension !in ALLOWED_EXTENSIONS) return null
 
             target
+
         } catch (_: Exception) {
             null
+        }
+    }
+
+    // -------------------------------------------------
+    // اعتبارسنجی مسیر فایل در تاریخچه
+    // -------------------------------------------------
+
+    private fun isSafeHistoricalPath(
+        projectRoot: File,
+        filePath: String
+    ): Boolean {
+        return try {
+            val target = File(filePath).canonicalFile
+
+            val rootPrefix =
+                projectRoot.path + File.separator
+
+            if (!target.path.startsWith(rootPrefix)) {
+                return false
+            }
+
+            val name = target.name.lowercase()
+            val extension = target.extension.lowercase()
+
+            name !in BLOCKED_NAMES &&
+                    extension !in BLOCKED_EXTENSIONS &&
+                    extension in ALLOWED_EXTENSIONS
+
+        } catch (_: Exception) {
+            false
         }
     }
 
@@ -166,6 +207,10 @@ class ProjectFileChangeManager(context: Context) {
         return digest.joinToString("") {
             "%02x".format(it)
         }
+    }
+
+    private fun isValidHash(value: String): Boolean {
+        return value.matches(Regex("^[a-fA-F0-9]{64}$"))
     }
 
     // -------------------------------------------------
@@ -400,19 +445,16 @@ class ProjectFileChangeManager(context: Context) {
                         "$backupId.json"
                     ).canonicalFile
 
-                    // ابتدا نسخه اصلی ذخیره می‌شود.
                     if (!writeBackup(backupFile, originalBytes)) {
                         return@synchronized ProjectFileChangeResult.Rejected(
                             "تهیه نسخه پشتیبان ناموفق بود؛ فایل اصلی تغییر نکرد."
                         )
                     }
 
-                    // ثبت اطلاعات نسخه پشتیبان
                     val manifest = JSONObject().apply {
 
                         put("projectPath", projectRoot.path)
                         put("filePath", target.path)
-
                         put("originalHash", originalHash)
 
                         put(
@@ -434,7 +476,6 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    // بررسی دوباره فایل قبل از اعمال
                     val latestBytes = target.readBytes()
 
                     if (
@@ -445,7 +486,6 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    // اعمال محتوای پیشنهادی
                     val written = writeAtomically(
                         target,
                         proposedBytes
@@ -457,7 +497,6 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    // بررسی صحت فایل نوشته‌شده
                     val finalHash = calculateHash(
                         target.readBytes()
                     )
@@ -492,6 +531,196 @@ class ProjectFileChangeManager(context: Context) {
                     ProjectFileChangeResult.Rejected(
                         e.message ?: "خطای نامشخص هنگام اعمال اصلاح."
                     )
+                }
+            }
+        }
+
+    // -------------------------------------------------
+    // دریافت تاریخچه نسخه‌های پشتیبان پروژه
+    // -------------------------------------------------
+
+    suspend fun getProjectHistory(
+        project: File
+    ): List<ProjectBackupEntry> =
+        withContext(Dispatchers.IO) {
+
+            synchronized(lock) {
+
+                try {
+
+                    val projectRoot = validateProject(project)
+                        ?: return@synchronized emptyList()
+
+                    val backupRoot = File(
+                        appContext.filesDir,
+                        BACKUP_DIRECTORY
+                    ).canonicalFile
+
+                    if (!backupRoot.isDirectory) {
+                        return@synchronized emptyList()
+                    }
+
+                    val manifests = backupRoot.listFiles()
+                        ?.filter {
+                            it.isFile &&
+                                    it.extension.equals(
+                                        "json",
+                                        ignoreCase = true
+                                    )
+                        }
+                        ?: return@synchronized emptyList()
+
+                    val history = mutableListOf<ProjectBackupEntry>()
+
+                    for (manifestFile in manifests) {
+
+                        try {
+
+                            if (
+                                !manifestFile.canonicalPath.startsWith(
+                                    backupRoot.path + File.separator
+                                )
+                            ) {
+                                continue
+                            }
+
+                            if (
+                                !manifestFile.canRead() ||
+                                manifestFile.length() > MAX_MANIFEST_SIZE
+                            ) {
+                                continue
+                            }
+
+                            val manifest = JSONObject(
+                                manifestFile.readText(Charsets.UTF_8)
+                            )
+
+                            val savedProjectPath =
+                                manifest.optString("projectPath")
+
+                            if (savedProjectPath != projectRoot.path) {
+                                continue
+                            }
+
+                            val savedFilePath =
+                                manifest.optString("filePath")
+
+                            if (
+                                savedFilePath.isBlank() ||
+                                !isSafeHistoricalPath(
+                                    projectRoot,
+                                    savedFilePath
+                                )
+                            ) {
+                                continue
+                            }
+
+                            val backupId =
+                                manifest.optString("backupId")
+
+                            if (backupId.isBlank()) {
+                                continue
+                            }
+
+                            val parsedId = try {
+                                UUID.fromString(backupId)
+                            } catch (_: Exception) {
+                                continue
+                            }
+
+                            if (parsedId.toString() != backupId) {
+                                continue
+                            }
+
+                            if (
+                                manifestFile.nameWithoutExtension != backupId
+                            ) {
+                                continue
+                            }
+
+                            val originalHash =
+                                manifest.optString("originalHash")
+
+                            val appliedHash =
+                                manifest.optString("appliedHash")
+
+                            val createdAt =
+                                manifest.optLong("createdAt", 0L)
+
+                            if (
+                                !isValidHash(originalHash) ||
+                                !isValidHash(appliedHash) ||
+                                createdAt <= 0L
+                            ) {
+                                continue
+                            }
+
+                            val backupFile = File(
+                                backupRoot,
+                                "$backupId.bak"
+                            ).canonicalFile
+
+                            val backupPrefix =
+                                backupRoot.path + File.separator
+
+                            val backupPathIsSafe =
+                                backupFile.path.startsWith(backupPrefix)
+
+                            val backupExists =
+                                backupPathIsSafe &&
+                                        backupFile.isFile &&
+                                        backupFile.canRead()
+
+                            val backupSize = if (backupExists) {
+                                backupFile.length()
+                            } else {
+                                0L
+                            }
+
+                            var isValid = false
+
+                            if (
+                                backupExists &&
+                                backupSize > 0L &&
+                                backupSize <= MAX_FILE_SIZE
+                            ) {
+
+                                val backupBytes =
+                                    backupFile.readBytes()
+
+                                isValid =
+                                    calculateHash(backupBytes) ==
+                                            originalHash
+                            }
+
+                            history.add(
+                                ProjectBackupEntry(
+                                    backupPath = if (backupPathIsSafe) {
+                                        backupFile.absolutePath
+                                    } else {
+                                        ""
+                                    },
+                                    projectPath = projectRoot.path,
+                                    filePath = savedFilePath,
+                                    originalHash = originalHash,
+                                    appliedHash = appliedHash,
+                                    createdAt = createdAt,
+                                    backupSize = backupSize,
+                                    isValid = isValid
+                                )
+                            )
+
+                        } catch (_: Exception) {
+                            // یک ورودی خراب نباید کل تاریخچه را متوقف کند.
+                        }
+                    }
+
+                    history.sortedByDescending {
+                        it.createdAt
+                    }
+
+                } catch (_: Exception) {
+                    emptyList()
                 }
             }
         }
@@ -597,14 +826,15 @@ class ProjectFileChangeManager(context: Context) {
                         savedFilePath != target.path ||
                         backupId != backupFile.nameWithoutExtension ||
                         originalHash.isBlank() ||
-                        appliedHash.isBlank()
+                        appliedHash.isBlank() ||
+                        !isValidHash(originalHash) ||
+                        !isValidHash(appliedHash)
                     ) {
                         return@synchronized ProjectFileRestoreResult.Rejected(
                             "این نسخه پشتیبان متعلق به این فایل نیست."
                         )
                     }
 
-                    // نگهداری نسخه فعلی برای بازیابی احتمالی
                     val currentBytes = target.readBytes()
 
                     if (currentBytes.size > MAX_FILE_SIZE) {
@@ -616,14 +846,12 @@ class ProjectFileChangeManager(context: Context) {
                     val currentHash =
                         calculateHash(currentBytes)
 
-                    // جلوگیری از حذف تغییرات جدید کاربر
                     if (currentHash != appliedHash) {
                         return@synchronized ProjectFileRestoreResult.Rejected(
                             "فایل پس از اصلاح تغییر کرده است. برای جلوگیری از حذف تغییرات جدید، بازگردانی متوقف شد."
                         )
                     }
 
-                    // بررسی سلامت نسخه پشتیبان
                     val backupBytes = backupFile.readBytes()
 
                     if (
@@ -636,7 +864,6 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    // بازگردانی نسخه اصلی
                     val restored = writeAtomically(
                         target,
                         backupBytes
@@ -648,16 +875,14 @@ class ProjectFileChangeManager(context: Context) {
                         )
                     }
 
-                    // بررسی نهایی
                     val finalBytes = target.readBytes()
 
                     val restoreVerified =
                         finalBytes.size <= MAX_FILE_SIZE &&
-                        calculateHash(finalBytes) == originalHash
+                                calculateHash(finalBytes) == originalHash
 
                     if (!restoreVerified) {
 
-                        // تلاش برای بازیابی نسخه قبل از بازگردانی
                         val rollbackSucceeded = writeAtomically(
                             target,
                             currentBytes
