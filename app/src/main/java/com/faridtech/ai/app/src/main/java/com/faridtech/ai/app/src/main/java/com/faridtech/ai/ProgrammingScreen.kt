@@ -1,6 +1,7 @@
 
 package com.faridtech.ai
 
+import android.content.Context
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -11,11 +12,14 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.launch
 
 private val ProgrammingGreen = Color(0xFF19C37D)
 
@@ -43,19 +47,30 @@ private val programmingTasks = listOf(
 
 @Composable
 fun ProgrammingScreen(
-    onBack: () -> Unit,
-    onSubmit: (
-        prompt: String,
-        code: String,
-        language: String,
-        task: String
-    ) -> Unit
+    context: Context,
+    onBack: () -> Unit
 ) {
-    var selectedLanguage by remember { mutableStateOf("Kotlin") }
-    var selectedTask by remember { mutableStateOf("تولید کد") }
+    val engine = remember(context) {
+        LocalAIEngine(context.applicationContext)
+    }
 
-    var prompt by remember { mutableStateOf("") }
-    var code by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+
+    var selectedLanguage by remember {
+        mutableStateOf("Kotlin")
+    }
+
+    var selectedTask by remember {
+        mutableStateOf("تولید کد")
+    }
+
+    var prompt by remember {
+        mutableStateOf("")
+    }
+
+    var code by remember {
+        mutableStateOf("")
+    }
 
     var languageMenuExpanded by remember {
         mutableStateOf(false)
@@ -63,6 +78,90 @@ fun ProgrammingScreen(
 
     var errorMessage by remember {
         mutableStateOf("")
+    }
+
+    var result by remember {
+        mutableStateOf("")
+    }
+
+    var generating by remember {
+        mutableStateOf(false)
+    }
+
+    var checkingModel by remember {
+        mutableStateOf(true)
+    }
+
+    var modelAvailable by remember {
+        mutableStateOf(false)
+    }
+
+    LaunchedEffect(engine) {
+        checkingModel = true
+
+        try {
+            modelAvailable = engine.checkModel()
+        } catch (e: Exception) {
+            modelAvailable = false
+        }
+
+        checkingModel = false
+    }
+
+    fun sendRequest() {
+        if (generating) return
+
+        if (prompt.isBlank() && code.isBlank()) {
+            errorMessage = "لطفاً توضیح درخواست یا کد خود را وارد کنید."
+            return
+        }
+
+        if (!modelAvailable) {
+            errorMessage = "مدل هوش مصنوعی نصب نشده است. ابتدا از بخش مدیریت مدل آن را دریافت کنید."
+            return
+        }
+
+        val formattedPrompt = buildString {
+            appendLine("You are a professional programming assistant.")
+            appendLine("Answer in Persian unless code requires otherwise.")
+            appendLine("Programming language: $selectedLanguage")
+            appendLine("Task: $selectedTask")
+            appendLine()
+            appendLine("User request:")
+            appendLine(prompt.ifBlank { "Please analyze the provided code." })
+
+            if (code.isNotBlank()) {
+                appendLine()
+                appendLine("User code:")
+                appendLine("```$selectedLanguage")
+                appendLine(code)
+                appendLine("```")
+            }
+
+            appendLine()
+            appendLine("Provide a clear, technically accurate answer.")
+            appendLine("When generating or fixing code, provide complete code where practical.")
+        }
+
+        generating = true
+        errorMessage = ""
+        result = ""
+
+        scope.launch {
+            try {
+                result = engine.generate(formattedPrompt)
+
+                if (result.isBlank()) {
+                    errorMessage = "مدل پاسخ خالی برگرداند."
+                }
+            } catch (e: Exception) {
+                errorMessage = "خطا در اجرای هوش مصنوعی: ${
+                    e.message ?: "خطای نامشخص"
+                }"
+            } finally {
+                generating = false
+            }
+        }
     }
 
     Column(
@@ -82,8 +181,7 @@ fun ProgrammingScreen(
             IconButton(onClick = onBack) {
                 Text(
                     "←",
-                    fontSize = 27.sp,
-                    color = MaterialTheme.colorScheme.onSurface
+                    fontSize = 27.sp
                 )
             }
 
@@ -144,10 +242,7 @@ fun ProgrammingScreen(
                     modifier = Modifier.padding(20.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Text(
-                        "👨‍💻",
-                        fontSize = 32.sp
-                    )
+                    Text("👨‍💻", fontSize = 32.sp)
 
                     Text(
                         "همراه هوشمند برنامه‌نویسی",
@@ -164,7 +259,53 @@ fun ProgrammingScreen(
                 }
             }
 
-            // Language selector
+            // Model status
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surface
+                )
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        when {
+                            checkingModel -> "⏳"
+                            modelAvailable -> "🟢"
+                            else -> "⚠️"
+                        },
+                        fontSize = 20.sp
+                    )
+
+                    Spacer(Modifier.width(10.dp))
+
+                    Column {
+                        Text(
+                            "وضعیت مدل هوش مصنوعی",
+                            fontWeight = FontWeight.SemiBold,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+
+                        Text(
+                            when {
+                                checkingModel -> "در حال بررسی فایل مدل..."
+                                modelAvailable -> "مدل محلی شناسایی شد"
+                                else -> "مدل نصب نشده است"
+                            },
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+
+            // Language
 
             Column(
                 verticalArrangement = Arrangement.spacedBy(9.dp)
@@ -188,7 +329,6 @@ fun ProgrammingScreen(
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Text(selectedLanguage)
-
                             Text("⌄")
                         }
                     }
@@ -201,9 +341,7 @@ fun ProgrammingScreen(
                     ) {
                         programmingLanguages.forEach { language ->
                             DropdownMenuItem(
-                                text = {
-                                    Text(language)
-                                },
+                                text = { Text(language) },
                                 onClick = {
                                     selectedLanguage = language
                                     languageMenuExpanded = false
@@ -214,7 +352,7 @@ fun ProgrammingScreen(
                 }
             }
 
-            // Task selection
+            // Task
 
             Column(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -225,39 +363,31 @@ fun ProgrammingScreen(
                     style = MaterialTheme.typography.titleMedium
                 )
 
-                Column(
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        programmingTasks.take(2).forEach { task ->
-                            FilterChip(
-                                selected = selectedTask == task,
-                                onClick = {
-                                    selectedTask = task
-                                },
-                                label = { Text(task) },
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
+                    programmingTasks.take(2).forEach { task ->
+                        FilterChip(
+                            selected = selectedTask == task,
+                            onClick = { selectedTask = task },
+                            label = { Text(task) },
+                            modifier = Modifier.weight(1f)
+                        )
                     }
+                }
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        programmingTasks.drop(2).forEach { task ->
-                            FilterChip(
-                                selected = selectedTask == task,
-                                onClick = {
-                                    selectedTask = task
-                                },
-                                label = { Text(task) },
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    programmingTasks.drop(2).forEach { task ->
+                        FilterChip(
+                            selected = selectedTask == task,
+                            onClick = { selectedTask = task },
+                            label = { Text(task) },
+                            modifier = Modifier.weight(1f)
+                        )
                     }
                 }
             }
@@ -281,9 +411,7 @@ fun ProgrammingScreen(
                     },
                     modifier = Modifier.fillMaxWidth(),
                     placeholder = {
-                        Text(
-                            "مثلاً یک صفحه ورود امن با Kotlin برای من بساز..."
-                        )
+                        Text("مثلاً یک صفحه ورود امن با Kotlin برای من بساز...")
                     },
                     minLines = 3,
                     maxLines = 6,
@@ -328,25 +456,11 @@ fun ProgrammingScreen(
                         Row(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(
-                                "●",
-                                color = Color(0xFFFF6B6B)
-                            )
-
+                            Text("●", color = Color(0xFFFF6B6B))
                             Spacer(Modifier.width(6.dp))
-
-                            Text(
-                                "●",
-                                color = Color(0xFFFFC857)
-                            )
-
+                            Text("●", color = Color(0xFFFFC857))
                             Spacer(Modifier.width(6.dp))
-
-                            Text(
-                                "●",
-                                color = ProgrammingGreen
-                            )
-
+                            Text("●", color = ProgrammingGreen)
                             Spacer(Modifier.width(12.dp))
 
                             Text(
@@ -374,9 +488,7 @@ fun ProgrammingScreen(
                                 fontSize = 13.sp,
                                 lineHeight = 21.sp
                             ),
-                            cursorBrush = androidx.compose.ui.graphics.SolidColor(
-                                ProgrammingGreen
-                            ),
+                            cursorBrush = SolidColor(ProgrammingGreen),
                             decorationBox = { innerTextField ->
                                 Box {
                                     if (code.isEmpty()) {
@@ -395,7 +507,7 @@ fun ProgrammingScreen(
                 }
             }
 
-            // Error message
+            // Error
 
             if (errorMessage.isNotEmpty()) {
                 Text(
@@ -408,24 +520,8 @@ fun ProgrammingScreen(
             // Submit
 
             Button(
-                onClick = {
-                    if (
-                        prompt.isBlank() &&
-                        code.isBlank()
-                    ) {
-                        errorMessage =
-                            "لطفاً توضیح درخواست یا کد خود را وارد کنید."
-                    } else {
-                        errorMessage = ""
-
-                        onSubmit(
-                            prompt.trim(),
-                            code,
-                            selectedLanguage,
-                            selectedTask
-                        )
-                    }
-                },
+                onClick = { sendRequest() },
+                enabled = !generating && !checkingModel,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(56.dp),
@@ -435,19 +531,70 @@ fun ProgrammingScreen(
                     contentColor = Color(0xFF062A1C)
                 )
             ) {
-                Text(
-                    "ارسال به هوش مصنوعی  ➜",
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.titleMedium
-                )
+                if (generating) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(22.dp),
+                        color = Color(0xFF062A1C),
+                        strokeWidth = 2.dp
+                    )
+
+                    Spacer(Modifier.width(10.dp))
+
+                    Text("هوش مصنوعی در حال پردازش...")
+                } else {
+                    Text(
+                        "ارسال به هوش مصنوعی  ➜",
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                }
             }
 
-            Text(
-                "اتصال به موتور هوش مصنوعی در مرحله بعد فعال می‌شود.",
-                modifier = Modifier.fillMaxWidth(),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.labelSmall
-            )
+            // Result
+
+            if (result.isNotBlank()) {
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text(
+                        "پاسخ هوش مصنوعی",
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.titleLarge
+                    )
+
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(18.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surface
+                        )
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Text(
+                                result,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+
+                            OutlinedButton(
+                                onClick = {
+                                    prompt = ""
+                                    code = ""
+                                    result = ""
+                                    errorMessage = ""
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("درخواست جدید")
+                            }
+                        }
+                    }
+                }
+            }
 
             Spacer(Modifier.height(12.dp))
         }
