@@ -317,7 +317,7 @@ internal class ProjectRecoveryJournal(context: Context) {
 
             val digest = MessageDigest.getInstance("SHA-256")
 
-            file.inputStream().use { input ->
+            AtomicFile(file).openRead().use { input ->
 
                 val buffer = ByteArray(8192)
                 var total = 0L
