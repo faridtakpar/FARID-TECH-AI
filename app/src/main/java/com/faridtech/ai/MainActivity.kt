@@ -161,7 +161,9 @@ fun OwnerAccessScreen(
                 "هوش مصنوعی محلی" -> {
                     ChatScreen(
                         context = context,
-                        onBack = { selectedSection = null },
+                        onBack = {
+                            selectedSection = null
+                        },
                         onExternalPickerStateChanged = { isOpen ->
                             (context as? MainActivity)
                                 ?.externalPickerOpen = isOpen
@@ -216,6 +218,10 @@ fun OwnerAccessScreen(
                         },
                         onBack = {
                             selectedSection = null
+                        },
+                        onOpenInAssistant = { project ->
+                            selectedProject = project
+                            selectedSection = "دستیار پروژه"
                         }
                     )
                 }
@@ -238,11 +244,30 @@ fun OwnerAccessScreen(
                     }
                 }
 
+                // بازکردن پروژه انتخاب‌شده در دستیار هوشمند
+                "دستیار پروژه" -> {
+                    val project = selectedProject
+
+                    if (project != null) {
+                        ProgrammingScreen(
+                            context = context,
+                            onBack = {
+                                selectedSection = "کتابخانه پروژه‌ها"
+                            },
+                            project = project
+                        )
+                    } else {
+                        selectedSection = "کتابخانه پروژه‌ها"
+                    }
+                }
+
                 null -> {
                     OwnerDashboard(
                         darkTheme = darkTheme,
                         onToggleTheme = onToggleTheme,
-                        onSelect = { selectedSection = it },
+                        onSelect = {
+                            selectedSection = it
+                        },
                         onLock = onLock
                     )
                 }
@@ -250,7 +275,9 @@ fun OwnerAccessScreen(
                 else -> {
                     SectionScreen(
                         title = selectedSection ?: "",
-                        onBack = { selectedSection = null }
+                        onBack = {
+                            selectedSection = null
+                        }
                     )
                 }
             }
@@ -398,7 +425,7 @@ private fun OwnerLoginScreen(
                             androidx.compose.foundation.text.KeyboardOptions(
                                 keyboardType =
                                     androidx.compose.ui.text.input.KeyboardType.Password
-                            ),
+                        ),
                         singleLine = true
                     )
                 }
@@ -653,7 +680,6 @@ fun OwnerDashboard(
             )
         }
 
-        // دسترسی به کتابخانه پروژه‌ها
         DashboardCard(
             emoji = "📚",
             title = "کتابخانه پروژه‌ها",
