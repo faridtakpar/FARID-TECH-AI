@@ -149,12 +149,27 @@ fun OwnerAccessScreen(
     ) {
         if (unlocked) {
             when (selectedSection) {
+
                 "هوش مصنوعی محلی" -> {
                     ChatScreen(
                         context = context,
                         onBack = { selectedSection = null },
                         onExternalPickerStateChanged = { isOpen ->
-                            (context as? MainActivity)?.externalPickerOpen = isOpen
+                            (context as? MainActivity)
+                                ?.externalPickerOpen = isOpen
+                        }
+                    )
+                }
+
+                "مدیریت مدل" -> {
+                    ModelManagementScreen(
+                        context = context,
+                        onBack = {
+                            selectedSection = null
+                        },
+                        onExternalPickerStateChanged = { isOpen ->
+                            (context as? MainActivity)
+                                ?.externalPickerOpen = isOpen
                         }
                     )
                 }
@@ -253,8 +268,12 @@ private fun OwnerLoginScreen(
                 .background(BrandGreen),
             contentAlignment = Alignment.Center
         ) {
-            Text("FT", color = Color.White, fontWeight = FontWeight.Bold,
-                style = MaterialTheme.typography.headlineMedium)
+            Text(
+                "FT",
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                style = MaterialTheme.typography.headlineMedium
+            )
         }
 
         Spacer(Modifier.height(20.dp))
