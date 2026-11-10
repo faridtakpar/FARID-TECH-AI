@@ -261,7 +261,6 @@ fun ProgrammingScreen(
         mutableStateOf(false)
     }
 
-    // اطلاعات آخرین نسخه پشتیبان
     var lastBackupPath by remember {
         mutableStateOf<String?>(null)
     }
@@ -278,7 +277,6 @@ fun ProgrammingScreen(
         mutableStateOf(false)
     }
 
-    // تاریخچه نسخه‌های پشتیبان
     val backupHistory = remember {
         mutableStateListOf<ProjectBackupEntry>()
     }
@@ -299,17 +297,122 @@ fun ProgrammingScreen(
         project?.absoluteFile
     }
 
+    // وضعیت ایمنی بازیابی پروژه
+    var recoveryInProgress by remember {
+        mutableStateOf(false)
+    }
+
+    var recoveryReady by remember {
+        mutableStateOf(projectRoot == null)
+    }
+
+    var recoveryError by remember {
+        mutableStateOf("")
+    }
+
+    val recoveryMessages = remember {
+        mutableStateListOf<String>()
+    }
+
+    // وقتی پروژه متصل است، تا پایان موفق بازیابی هیچ عملیات
+    // حساس فایل مجاز نیست.
+    val projectOperationsAllowed =
+        projectRoot == null || recoveryReady
+
     val busy = generating ||
         applyingChange ||
         restoringBackup ||
-        loadingFile
+        loadingFile ||
+        recoveryInProgress
+
+    // -------------------------------------------------
+    // بازیابی و بارگذاری امن پروژه
+    // -------------------------------------------------
+
+    suspend fun recoverAndLoadProject(root: File) {
+        recoveryInProgress = true
+        recoveryReady = false
+        recoveryError = ""
+
+        loadingProjectFiles = true
+        loadingBackupHistory = true
+
+        projectFiles.clear()
+        selectedProjectFile = null
+        pendingChange = null
+        showChangeReview = false
+
+        recoveryMessages.clear()
+        projectError = ""
+        backupHistoryError = ""
+
+        lastBackupPath = null
+        undoTargetFile = null
+        backupHistory.clear()
+
+        var recoverySucceeded = false
+
+        try {
+            val messages = withContext(Dispatchers.IO) {
+                changeManager.recoverPendingOperations(root)
+            }
+
+            recoveryMessages.addAll(messages)
+
+            // فقط پس از بازگشت موفق عملیات بازیابی،
+            // اجازه استفاده از قابلیت‌های فایل صادر می‌شود.
+            recoveryReady = true
+            recoverySucceeded = true
+
+            val files = scanSafeProjectFiles(
+                context,
+                root
+            )
+
+            projectFiles.addAll(files)
+
+            if (files.isEmpty()) {
+                projectError =
+                    "فایل متنی قابل بررسی در پروژه پیدا نشد."
+            }
+
+            val history = withContext(Dispatchers.IO) {
+                changeManager.getProjectHistory(root)
+            }
+
+            backupHistory.clear()
+            backupHistory.addAll(history)
+
+        } catch (e: Exception) {
+            if (!recoverySucceeded) {
+                recoveryReady = false
+                recoveryError =
+                    e.message ?: "بازیابی عملیات نیمه‌تمام ناموفق بود."
+            } else {
+                projectError =
+                    e.message ?: "بارگذاری اطلاعات پروژه ناموفق بود."
+            }
+        } finally {
+            recoveryInProgress = false
+            loadingProjectFiles = false
+            loadingBackupHistory = false
+        }
+    }
 
     // -------------------------------------------------
     // تازه‌سازی تاریخچه
     // -------------------------------------------------
 
     fun refreshBackupHistory() {
+        if (!projectOperationsAllowed) {
+            backupHistoryError =
+                "ابتدا باید بازیابی پروژه با موفقیت انجام شود."
+            return
+        }
+
         val root = projectRoot ?: return
+
+        if (loadingBackupHistory || busy) return
 
         scope.launch {
             loadingBackupHistory = true
@@ -349,55 +452,20 @@ fun ProgrammingScreen(
     }
 
     // -------------------------------------------------
-    // بارگذاری اطلاعات پروژه
+    // بارگذاری و بازیابی اطلاعات پروژه
     // -------------------------------------------------
 
     LaunchedEffect(projectRoot) {
-        projectFiles.clear()
-        selectedProjectFile = null
-        pendingChange = null
-        showChangeReview = false
-        projectError = ""
-
-        lastBackupPath = null
-        undoTargetFile = null
-
-        backupHistory.clear()
-        backupHistoryError = ""
-
         val currentProject = projectRoot
-            ?: return@LaunchedEffect
 
-        loadingProjectFiles = true
-        loadingBackupHistory = true
-
-        try {
-            val files = scanSafeProjectFiles(
-                context,
-                currentProject
-            )
-
-            projectFiles.addAll(files)
-
-            if (files.isEmpty()) {
-                projectError =
-                    "فایل متنی قابل بررسی در پروژه پیدا نشد."
-            }
-
-            val history = withContext(Dispatchers.IO) {
-                changeManager.getProjectHistory(currentProject)
-            }
-
-            backupHistory.clear()
-            backupHistory.addAll(history)
-
-        } catch (e: Exception) {
-            projectError =
-                e.message ?: "خواندن اطلاعات پروژه ناموفق بود."
-        } finally {
-            loadingProjectFiles = false
-            loadingBackupHistory = false
+        if (currentProject == null) {
+            recoveryReady = true
+            recoveryInProgress = false
+            recoveryError = ""
+            return@LaunchedEffect
         }
+
+        recoverAndLoadProject(currentProject)
     }
 
     // -------------------------------------------------
@@ -405,7 +473,7 @@ fun ProgrammingScreen(
     // -------------------------------------------------
 
     fun selectProjectFile(file: File) {
-        if (busy) return
+        if (busy || !projectOperationsAllowed) return
 
         val root = projectRoot ?: return
 
@@ -467,6 +535,12 @@ fun ProgrammingScreen(
 
     fun sendRequest() {
         if (busy) return
+
+        if (!projectOperationsAllowed) {
+            errorMessage =
+                "تا پایان موفق بازیابی پروژه، ارسال درخواست مرتبط با پروژه مجاز نیست."
+            return
+        }
 
         if (prompt.isBlank() && code.isBlank()) {
             errorMessage =
@@ -633,6 +707,12 @@ fun ProgrammingScreen(
                     return@launch
                 }
 
+                if (!projectOperationsAllowed) {
+                    errorMessage =
+                        "بازیابی پروژه کامل نشده است؛ هیچ فایلی تغییر نکرد."
+                    return@launch
+                }
+
                 val diskContent = withContext(Dispatchers.IO) {
                     if (!isSafeProjectFile(root, file)) {
                         throw SecurityException(
@@ -683,9 +763,15 @@ fun ProgrammingScreen(
     // -------------------------------------------------
 
     fun confirmProjectChange() {
+        if (!projectOperationsAllowed || recoveryInProgress) {
+            errorMessage =
+                "تا پایان موفق بازیابی، اعمال تغییر مجاز نیست."
+            return
+        }
+
         val preview = pendingChange ?: return
 
-        if (applyingChange || restoringBackup) return
+        if (applyingChange || restoringBackup || generating) return
 
         scope.launch {
             applyingChange = true
@@ -735,11 +821,17 @@ fun ProgrammingScreen(
     // -------------------------------------------------
 
     fun restoreLastChange() {
+        if (!projectOperationsAllowed || recoveryInProgress) {
+            errorMessage =
+                "تا پایان موفق بازیابی، بازگردانی مجاز نیست."
+            return
+        }
+
         val backup = lastBackupPath ?: return
         val target = undoTargetFile ?: return
         val root = projectRoot ?: return
 
-        if (restoringBackup || applyingChange) return
+        if (restoringBackup || applyingChange || generating) return
 
         scope.launch {
             restoringBackup = true
@@ -757,6 +849,12 @@ fun ProgrammingScreen(
                     is ProjectFileRestoreResult.Restored -> {
                         val restoredContent =
                             withContext(Dispatchers.IO) {
+                                if (!isSafeProjectFile(root, target)) {
+                                    throw SecurityException(
+                                        "فایل بازگردانی‌شده در مسیر مجاز قرار ندارد."
+                                    )
+                                }
+
                                 target.readText(Charsets.UTF_8)
                             }
 
@@ -801,6 +899,12 @@ fun ProgrammingScreen(
 
     fun restoreHistoricalVersion(entry: ProjectBackupEntry) {
 
+        if (!projectOperationsAllowed || recoveryInProgress) {
+            errorMessage =
+                "تا پایان موفق بازیابی، بازگردانی نسخه تاریخی مجاز نیست."
+            return
+        }
+
         val root = projectRoot ?: run {
             errorMessage = "پروژه انتخاب‌شده معتبر نیست."
             return
@@ -818,14 +922,12 @@ fun ProgrammingScreen(
 
         val target = File(entry.filePath)
 
-        // وضعیت عملیات بلافاصله فعال می‌شود تا از اجرای تکراری جلوگیری شود.
         restoringBackup = true
         errorMessage = ""
         backupHistoryError = ""
 
         scope.launch {
             try {
-
                 val restoreResult = changeManager.restoreHistoricalBackup(
                     project = root,
                     file = target,
@@ -837,7 +939,6 @@ fun ProgrammingScreen(
 
                     is ProjectFileRestoreResult.Restored -> {
 
-                        // خواندن محتوای نسخه بازگردانی‌شده
                         val restoredContent =
                             withContext(Dispatchers.IO) {
 
@@ -850,7 +951,6 @@ fun ProgrammingScreen(
                                 target.readText(Charsets.UTF_8)
                             }
 
-                        // به‌روزرسانی ویرایشگر فقط اگر همین فایل انتخاب شده باشد.
                         val selectedFileMatches = try {
                             selectedProjectFile?.canonicalPath ==
                                 target.canonicalPath
@@ -862,7 +962,6 @@ fun ProgrammingScreen(
                             code = restoredContent
                         }
 
-                        // نسخه بازگردانی‌شده اکنون وضعیت فعلی فایل است.
                         lastBackupPath = null
                         undoTargetFile = null
                         showRestoreConfirmation = false
@@ -873,7 +972,6 @@ fun ProgrammingScreen(
                         projectError =
                             "نسخه فعلی قبل از بازگردانی نیز به‌عنوان پشتیبان ذخیره شد."
 
-                        // تازه‌سازی تاریخچه برای نمایش پشتیبان جدید
                         val updatedHistory =
                             withContext(Dispatchers.IO) {
                                 changeManager.getProjectHistory(root)
@@ -881,7 +979,6 @@ fun ProgrammingScreen(
 
                         backupHistory.clear()
                         backupHistory.addAll(updatedHistory)
-
                     }
 
                     is ProjectFileRestoreResult.Rejected -> {
@@ -1014,117 +1111,187 @@ fun ProgrammingScreen(
                             fontWeight = FontWeight.SemiBold
                         )
 
-                        Text(
-                            if (loadingProjectFiles) {
-                                "در حال بررسی فایل‌های پروژه..."
-                            } else {
-                                "${projectFiles.size} فایل مجاز برای بررسی پیدا شد."
-                            },
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = MaterialTheme.typography.bodySmall
-                        )
-
-                        OutlinedButton(
-                            onClick = { showProjectFiles = true },
-                            enabled = !loadingProjectFiles && !busy,
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("انتخاب فایل از پروژه")
-                        }
-
-                        selectedProjectFile?.let { file ->
-                            Text(
-                                "فایل انتخاب‌شده: ${file.name}",
-                                color = ProgrammingGreen,
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                        }
-
-                        if (loadingFile) {
-                            LinearProgressIndicator(
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                        }
-
-                        if (projectError.isNotBlank()) {
-                            Text(
-                                projectError,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                        }
-
-                        HorizontalDivider()
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column(
-                                modifier = Modifier.weight(1f),
-                                verticalArrangement = Arrangement.spacedBy(3.dp)
-                            ) {
+                        when {
+                            recoveryInProgress -> {
                                 Text(
-                                    "🗂 تاریخچه نسخه‌های پشتیبان",
-                                    fontWeight = FontWeight.SemiBold
+                                    "در حال بررسی و بازیابی عملیات نیمه‌تمام...",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+
+                                LinearProgressIndicator(
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
+
+                            !recoveryReady -> {
+                                Text(
+                                    "بازیابی پروژه با موفقیت انجام نشد. عملیات فایل‌ها تا رفع مشکل غیرفعال است.",
+                                    color = MaterialTheme.colorScheme.error,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+
+                                if (recoveryError.isNotBlank()) {
+                                    Text(
+                                        recoveryError,
+                                        color = MaterialTheme.colorScheme.error,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+
+                                Button(
+                                    onClick = {
+                                        val root = projectRoot
+                                        scope.launch {
+                                            recoverAndLoadProject(root)
+                                        }
+                                    },
+                                    enabled = !busy,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("تلاش مجدد برای بازیابی")
+                                }
+                            }
+
+                            else -> {
+                                Text(
+                                    "بازیابی پروژه با موفقیت انجام شد.",
+                                    color = ProgrammingGreen,
+                                    style = MaterialTheme.typography.bodySmall
                                 )
 
                                 Text(
-                                    if (loadingBackupHistory) {
-                                        "در حال بارگذاری تاریخچه..."
+                                    if (loadingProjectFiles) {
+                                        "در حال بررسی فایل‌های پروژه..."
                                     } else {
-                                        "${backupHistory.size} نسخه پشتیبان ثبت شده"
+                                        "${projectFiles.size} فایل مجاز برای بررسی پیدا شد."
                                     },
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     style = MaterialTheme.typography.bodySmall
                                 )
-                            }
 
-                            TextButton(
-                                onClick = {
-                                    refreshBackupHistory()
-                                },
-                                enabled = !loadingBackupHistory && !busy
-                            ) {
-                                Text("به‌روزرسانی")
-                            }
-                        }
+                                OutlinedButton(
+                                    onClick = {
+                                        showProjectFiles = true
+                                    },
+                                    enabled = !loadingProjectFiles && !busy,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("انتخاب فایل از پروژه")
+                                }
 
-                        OutlinedButton(
-                            onClick = {
-                                showBackupHistory = true
-                                refreshBackupHistory()
-                            },
-                            enabled = !loadingBackupHistory && !busy,
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(14.dp)
-                        ) {
-                            Text("مشاهده تاریخچه نسخه‌ها")
-                        }
+                                selectedProjectFile?.let { file ->
+                                    Text(
+                                        "فایل انتخاب‌شده: ${file.name}",
+                                        color = ProgrammingGreen,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
 
-                        if (lastBackupPath != null) {
-                            HorizontalDivider()
+                                if (loadingFile) {
+                                    LinearProgressIndicator(
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                }
 
-                            Text(
-                                "نسخه پشتیبان آخرین اصلاح آماده است.",
-                                color = ProgrammingGreen,
-                                style = MaterialTheme.typography.bodySmall
-                            )
+                                if (projectError.isNotBlank()) {
+                                    Text(
+                                        projectError,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
 
-                            Button(
-                                onClick = {
-                                    showRestoreConfirmation = true
-                                },
-                                enabled = !busy,
-                                modifier = Modifier.fillMaxWidth(),
-                                shape = RoundedCornerShape(14.dp),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = Color(0xFFB45309),
-                                    contentColor = Color.White
-                                )
-                            ) {
-                                Text("↶  بازگردانی آخرین اصلاح")
+                                if (recoveryMessages.isNotEmpty()) {
+                                    HorizontalDivider()
+
+                                    Text(
+                                        "گزارش بازیابی",
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+
+                                    recoveryMessages.forEach { message ->
+                                        Text(
+                                            message,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
+                                }
+
+                                HorizontalDivider()
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Column(
+                                        modifier = Modifier.weight(1f),
+                                        verticalArrangement = Arrangement.spacedBy(3.dp)
+                                    ) {
+                                        Text(
+                                            "🗂 تاریخچه نسخه‌های پشتیبان",
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+
+                                        Text(
+                                            if (loadingBackupHistory) {
+                                                "در حال بارگذاری تاریخچه..."
+                                            } else {
+                                                "${backupHistory.size} نسخه پشتیبان ثبت شده"
+                                            },
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
+
+                                    TextButton(
+                                        onClick = {
+                                            refreshBackupHistory()
+                                        },
+                                        enabled = !loadingBackupHistory && !busy
+                                    ) {
+                                        Text("به‌روزرسانی")
+                                    }
+                                }
+
+                                OutlinedButton(
+                                    onClick = {
+                                        showBackupHistory = true
+                                        refreshBackupHistory()
+                                    },
+                                    enabled = !loadingBackupHistory && !busy,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(14.dp)
+                                ) {
+                                    Text("مشاهده تاریخچه نسخه‌ها")
+                                }
+
+                                if (lastBackupPath != null) {
+                                    HorizontalDivider()
+
+                                    Text(
+                                        "نسخه پشتیبان آخرین اصلاح آماده است.",
+                                        color = ProgrammingGreen,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+
+                                    Button(
+                                        onClick = {
+                                            showRestoreConfirmation = true
+                                        },
+                                        enabled = !busy,
+                                        modifier = Modifier.fillMaxWidth(),
+                                        shape = RoundedCornerShape(14.dp),
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = Color(0xFFB45309),
+                                            contentColor = Color.White
+                                        )
+                                    ) {
+                                        Text("↶  بازگردانی آخرین اصلاح")
+                                    }
+                                }
                             }
                         }
                     }
@@ -1386,7 +1553,9 @@ fun ProgrammingScreen(
 
             Button(
                 onClick = { sendRequest() },
-                enabled = !busy && !checkingModel,
+                enabled = !busy &&
+                    !checkingModel &&
+                    projectOperationsAllowed,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(56.dp),
@@ -1499,7 +1668,7 @@ fun ProgrammingScreen(
                                 onClick = {
                                     selectProjectFile(file)
                                 },
-                                enabled = !busy,
+                                enabled = !busy && projectOperationsAllowed,
                                 modifier = Modifier.fillMaxWidth()
                             ) {
                                 Column(
@@ -1626,7 +1795,8 @@ fun ProgrammingScreen(
                     onClick = {
                         restoreLastChange()
                     },
-                    enabled = !restoringBackup,
+                    enabled = !restoringBackup &&
+                        projectOperationsAllowed,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = Color(0xFFB45309)
                     )
