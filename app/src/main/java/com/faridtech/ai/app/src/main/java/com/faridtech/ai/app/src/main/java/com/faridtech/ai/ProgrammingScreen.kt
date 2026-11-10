@@ -20,6 +20,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -297,25 +298,28 @@ fun ProgrammingScreen(
         project?.absoluteFile
     }
 
+    // -------------------------------------------------
     // وضعیت ایمنی بازیابی پروژه
-    var recoveryInProgress by remember {
+    // با تغییر پروژه، وضعیت قبلی منتقل نمی‌شود.
+    // -------------------------------------------------
+
+    var recoveryInProgress by remember(projectRoot) {
         mutableStateOf(false)
     }
 
-    var recoveryReady by remember {
+    var recoveryReady by remember(projectRoot) {
         mutableStateOf(projectRoot == null)
     }
 
-    var recoveryError by remember {
+    var recoveryError by remember(projectRoot) {
         mutableStateOf("")
     }
 
-    val recoveryMessages = remember {
+    val recoveryMessages = remember(projectRoot) {
         mutableStateListOf<String>()
     }
 
-    // وقتی پروژه متصل است، تا پایان موفق بازیابی هیچ عملیات
-    // حساس فایل مجاز نیست.
+    // تا زمان بازیابی موفق، عملیات فایل مجاز نیست.
     val projectOperationsAllowed =
         projectRoot == null || recoveryReady
 
@@ -359,10 +363,9 @@ fun ProgrammingScreen(
 
             recoveryMessages.addAll(messages)
 
-            // فقط پس از بازگشت موفق عملیات بازیابی،
-            // اجازه استفاده از قابلیت‌های فایل صادر می‌شود.
-            recoveryReady = true
+            // فقط بعد از موفقیت بازیابی، قفل باز می‌شود.
             recoverySucceeded = true
+            recoveryReady = true
 
             val files = scanSafeProjectFiles(
                 context,
@@ -383,6 +386,10 @@ fun ProgrammingScreen(
             backupHistory.clear()
             backupHistory.addAll(history)
 
+        } catch (e: CancellationException) {
+            // لغو عملیات باید به فراخواننده منتقل شود.
+            throw e
+
         } catch (e: Exception) {
             if (!recoverySucceeded) {
                 recoveryReady = false
@@ -392,6 +399,7 @@ fun ProgrammingScreen(
                 projectError =
                     e.message ?: "بارگذاری اطلاعات پروژه ناموفق بود."
             }
+
         } finally {
             recoveryInProgress = false
             loadingProjectFiles = false
@@ -403,8 +411,8 @@ fun ProgrammingScreen(
     // تازه‌سازی تاریخچه
     // -------------------------------------------------
 
-    fun refreshBackupHistory() {
-        if (!projectOperationsAllowed) {
+    fun refreshBackupHistory(force: Boolean = false) {
+        if (!projectOperationsAllowed || recoveryInProgress) {
             backupHistoryError =
                 "ابتدا باید بازیابی پروژه با موفقیت انجام شود."
             return
@@ -412,12 +420,14 @@ fun ProgrammingScreen(
 
         val root = projectRoot ?: return
 
-        if (loadingBackupHistory || busy) return
+        if (loadingBackupHistory || (busy && !force)) {
+            return
+        }
+
+        loadingBackupHistory = true
+        backupHistoryError = ""
 
         scope.launch {
-            loadingBackupHistory = true
-            backupHistoryError = ""
-
             try {
                 val entries = withContext(Dispatchers.IO) {
                     changeManager.getProjectHistory(root)
@@ -426,9 +436,13 @@ fun ProgrammingScreen(
                 backupHistory.clear()
                 backupHistory.addAll(entries)
 
+            } catch (e: CancellationException) {
+                throw e
+
             } catch (e: Exception) {
                 backupHistoryError =
                     e.message ?: "بارگذاری تاریخچه ناموفق بود."
+
             } finally {
                 loadingBackupHistory = false
             }
@@ -520,9 +534,13 @@ fun ProgrammingScreen(
                 pendingChange = null
                 showChangeReview = false
 
+            } catch (e: CancellationException) {
+                throw e
+
             } catch (e: Exception) {
                 projectError =
                     e.message ?: "خواندن فایل انجام نشد."
+
             } finally {
                 loadingFile = false
             }
@@ -747,11 +765,15 @@ fun ProgrammingScreen(
                     "پیشنهاد اصلاح آماده است. نسخه‌ها را در پنجره بازبینی بررسی کن."
                 showChangeReview = true
 
+            } catch (e: CancellationException) {
+                throw e
+
             } catch (e: Exception) {
                 errorMessage =
                     "خطا در اجرای درخواست: ${
                         e.message ?: "خطای نامشخص"
                     }"
+
             } finally {
                 generating = false
             }
@@ -799,7 +821,7 @@ fun ProgrammingScreen(
                         pendingChange = null
                         showChangeReview = false
 
-                        refreshBackupHistory()
+                        refreshBackupHistory(force = true)
                     }
 
                     is ProjectFileChangeResult.Rejected -> {
@@ -807,9 +829,13 @@ fun ProgrammingScreen(
                     }
                 }
 
+            } catch (e: CancellationException) {
+                throw e
+
             } catch (e: Exception) {
                 errorMessage =
                     e.message ?: "اعمال اصلاح ناموفق بود."
+
             } finally {
                 applyingChange = false
             }
@@ -875,7 +901,7 @@ fun ProgrammingScreen(
                         undoTargetFile = null
                         showRestoreConfirmation = false
 
-                        refreshBackupHistory()
+                        refreshBackupHistory(force = true)
                     }
 
                     is ProjectFileRestoreResult.Rejected -> {
@@ -884,9 +910,13 @@ fun ProgrammingScreen(
                     }
                 }
 
+            } catch (e: CancellationException) {
+                throw e
+
             } catch (e: Exception) {
                 errorMessage =
                     e.message ?: "بازگردانی نسخه پشتیبان ناموفق بود."
+
             } finally {
                 restoringBackup = false
             }
@@ -986,9 +1016,13 @@ fun ProgrammingScreen(
                     }
                 }
 
+            } catch (e: CancellationException) {
+                throw e
+
             } catch (e: Exception) {
                 errorMessage =
                     e.message ?: "بازگردانی نسخه تاریخی ناموفق بود."
+
             } finally {
                 restoringBackup = false
             }
