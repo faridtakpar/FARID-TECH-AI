@@ -6,6 +6,7 @@ import android.util.AtomicFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.security.MessageDigest
@@ -216,26 +217,42 @@ class ProjectFileChangeManager(context: Context) {
     }
 
     // -------------------------------------------------
-    // خواندن کنترل‌شده فایل
+    // خواندن کنترل‌شده و امن فایل با AtomicFile
     // -------------------------------------------------
 
     private fun readLimitedFile(file: File): ByteArray? {
         return try {
-            if (!file.isFile || !file.canRead()) {
+            if (!file.exists() || !file.isFile || !file.canRead()) {
                 return null
             }
 
-            if (file.length() > MAX_FILE_SIZE) {
-                return null
+            val atomicFile = AtomicFile(file)
+            val output = ByteArrayOutputStream()
+            val buffer = ByteArray(8192)
+
+            var totalBytes = 0L
+
+            atomicFile.openRead().use { input ->
+
+                while (true) {
+
+                    val count = input.read(buffer)
+
+                    if (count == -1) {
+                        break
+                    }
+
+                    totalBytes += count
+
+                    if (totalBytes > MAX_FILE_SIZE) {
+                        return null
+                    }
+
+                    output.write(buffer, 0, count)
+                }
             }
 
-            val bytes = file.readBytes()
-
-            if (bytes.size > MAX_FILE_SIZE) {
-                return null
-            }
-
-            bytes
+            output.toByteArray()
 
         } catch (_: Exception) {
             null
@@ -251,11 +268,12 @@ class ProjectFileChangeManager(context: Context) {
         bytes: ByteArray
     ): Boolean {
 
-        var output: FileOutputStream? = null
-
         val atomicFile = AtomicFile(target)
 
+        var output: FileOutputStream? = null
+
         return try {
+
             val parent = target.parentFile
                 ?: return false
 
@@ -263,12 +281,14 @@ class ProjectFileChangeManager(context: Context) {
                 return false
             }
 
-            output = atomicFile.startWrite()
+            val stream = atomicFile.startWrite()
 
-            output.write(bytes)
-            output.fd.sync()
+            output = stream
 
-            atomicFile.finishWrite(output)
+            stream.write(bytes)
+            stream.fd.sync()
+
+            atomicFile.finishWrite(stream)
 
             output = null
 
@@ -276,9 +296,9 @@ class ProjectFileChangeManager(context: Context) {
 
         } catch (_: Exception) {
 
-            if (output != null) {
+            output?.let { stream ->
                 try {
-                    atomicFile.failWrite(output)
+                    atomicFile.failWrite(stream)
                 } catch (_: Exception) {
                 }
             }
